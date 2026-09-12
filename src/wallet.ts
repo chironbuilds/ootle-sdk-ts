@@ -1,7 +1,12 @@
 import {
+  Mask,
   Network,
   OotleWallet,
+  StealthInput,
+  StealthInputsStatement,
+  StealthOutputsStatement,
   StealthTransfer,
+  StealthTransferStatement,
   TransactionBuilder,
   WalletStealthAuthorizer,
   WasmStealthCrypto,
@@ -1219,6 +1224,128 @@ export class OotleAccount implements WalletAccountApi {
     const envelope = await authorized.seal();
     const transactionId = await submitTransaction(provider, envelope);
     const response = await withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the transaction");
+    await recordKnownVersions(response);
+    return { transactionId };
+  }
+
+  /**
+   * Redeems one *specific, externally-known* stealth (freestanding) UTXO — a commitment this
+   * account was told about out of band (e.g. a ticket/ballot/voucher token some other party
+   * minted straight to this wallet's address), as opposed to `withdrawStealthAndExecute`'s
+   * *amount* drawn from this account's own tracked vault balance. Reveals the output's full
+   * value as a `Bucket` on the workspace under id `0`, then runs `followUpInstructions` (which
+   * must reference that bucket via `{Workspace: {id: 0, offset: null}}`) in the same signed
+   * transaction — e.g. handing it straight to a voting/redemption contract's own method.
+   *
+   * `revealedAmount` must be the output's *actual* value — there is no client-side way to
+   * discover it other than decrypting the UTXO (which this method's `WalletStealthAuthorizer`
+   * step does internally, using this account's own view secret, as part of resolving the
+   * spend); the caller is expected to already know it from whatever protocol minted the token
+   * (e.g. a fixed "amount-1 ballot" convention). A wrong value fails the balance proof inside
+   * `prepare()`, not silently.
+   *
+   * Bypasses the `StealthTransfer` fluent builder (its `spendStealthInput` targets *this
+   * account's own* previously-shielded outputs, tracked in local storage — see `unshield`'s doc
+   * comment on why no scan-by-commitment API exists for outputs this account never shielded
+   * itself) and instead hand-builds the same wire statement `unshield`/`shield`/
+   * `withdrawStealthAndExecute` produce via the builder, the same way the reference voter
+   * client for this pattern does (a zero-stealth-input-count, `KeyPath`-witnessed, fully-revealed
+   * transfer) — `WalletStealthAuthorizer.prepare()` fetches and unblinds the named commitment the
+   * same way regardless of which path built the statement.
+   *
+   * @param relatedComponents Every *other* component `followUpInstructions` touches — same
+   *   reasoning as `withdrawStealthAndExecute`'s own parameter of the same name.
+   */
+  async redeemStealthOutputAndExecute(
+    resourceAddress: string,
+    commitmentHex: string,
+    revealedAmount: bigint,
+    followUpInstructions: Instruction[],
+    relatedComponents: string[] = [],
+    maxFee = 100000n
+  ): Promise<{ transactionId: string }> {
+    if (revealedAmount <= 0n) {
+      throw new Error(`redeemStealthOutputAndExecute: revealedAmount must be > 0, got ${revealedAmount}`);
+    }
+    if (!/^[0-9a-f]{64}$/i.test(commitmentHex)) {
+      throw new Error(`redeemStealthOutputAndExecute: commitmentHex must be exactly 64 hex characters (32 bytes)`);
+    }
+    const provider = await this.getProvider();
+    const account = await this.getComponentAddress();
+    const commitment = fromHex(commitmentHex);
+
+    // An "incomplete" statement: the input side only names the commitment being spent (its mask
+    // and value are recovered later, by the authorizer, from the on-chain UTXO) and declares a
+    // `KeyPath` witness — ordinary one-time-key ownership, the same proof shield/unshield/
+    // withdrawStealthAndExecute use, as opposed to htlcClaim/htlcRefund's script-path leaf. The
+    // output side is empty (no new stealth output at all): the full value is revealed instead.
+    const inputsJson = JSON.stringify({
+      inputs: [{ commitment: commitmentHex, witness: "KeyPath" }],
+      revealed_amount: "0",
+    });
+    const outputsJson = JSON.stringify({
+      outputs: [],
+      revealed_output_amount: revealedAmount.toString(),
+      agg_range_proof: "",
+    });
+    const statement = new StealthTransferStatement(
+      new StealthInputsStatement([], 0n, inputsJson),
+      new StealthOutputsStatement(outputsJson)
+    );
+
+    const maxEpoch = await resolveMaxEpoch(provider);
+    const builder = TransactionBuilder.new(this.network, maxEpoch)
+      .addInstruction({
+        StealthTransfer: {
+          resource_address_ref: { Address: resourceAddress },
+          statement: { __ootleRawJson: statement.toCompactJson() },
+          revealed_input_bucket: null,
+        },
+      } as unknown as Instruction)
+      // Claims workspace id 0 for the revealed bucket above — followUpInstructions must reference
+      // it as a plain numeric `{Workspace: {id: 0, offset: null}}`, not a named `{Workspace: ".."}`
+      // (name resolution only applies to instructions built through *this* same chain; raw
+      // pre-built instructions bypass it, same constraint `withdrawStealthAndExecute` documents).
+      .saveVar("redeemed")
+      .withInstructions(followUpInstructions)
+      .feeTransactionPayFromComponent(account, maxFee)
+      .addInput({ substate_id: resourceAddress, version: null })
+      .addInput({ substate_id: stealthUtxoSubstateId(resourceAddress, commitment), version: null })
+      .addInput({ substate_id: account, version: null });
+    for (const vaultId of await getVaultIdsForAccount(provider, account)) {
+      builder.addInput({ substate_id: vaultId, version: null });
+    }
+    for (const component of relatedComponents) {
+      builder.addInput({ substate_id: component, version: null });
+      for (const vaultId of await getVaultIdsForAccount(provider, component)) {
+        builder.addInput({ substate_id: vaultId, version: null });
+      }
+    }
+    const unsignedTx = await resolveTransaction(provider, builder.buildUnsignedTransaction());
+
+    const spec: StealthTransferSpec = {
+      unsignedTx,
+      statement,
+      outputMask: Mask.zero(),
+      state: {
+        resource: resourceAddress,
+        revealedInput: null,
+        inputsToSpend: new Map([[commitmentHex, { input: new StealthInput(commitment), owner: account }]]),
+        outputs: [],
+        revealedOutputAmount: revealedAmount,
+      },
+      requiredSigners: [account],
+      inputs: [{ input: new StealthInput(commitment), owner: account }],
+    };
+
+    const wallet = new OotleWallet().registerKeyProvider(account, this.signer).setDefaultSigner(account);
+    const viewSecret = await this.signer.getViewSecret();
+    const authorized = await WalletStealthAuthorizer.fromSpec(wallet, spec, { viewSecret, crypto: new WasmStealthCrypto(this.network) }).prepare(
+      provider
+    );
+    const envelope = await authorized.seal();
+    const transactionId = await submitTransaction(provider, envelope);
+    const response = await withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the redemption transaction");
     await recordKnownVersions(response);
     return { transactionId };
   }
