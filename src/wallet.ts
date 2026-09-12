@@ -2020,7 +2020,10 @@ export class OotleAccount implements WalletAccountApi {
    * bounded lookback -- meant for an interactive "do I have one of these" check on a resource
    * whose mint is known to be recent, not a background sweep of the whole chain.
    */
-  async scanForResourceUtxos(resourceAddress: string, opts: { maxPages?: number; pageSize?: number } = {}): Promise<ScannedStealthOutput[]> {
+  async scanForResourceUtxos(
+    resourceAddress: string,
+    opts: { maxPages?: number; pageSize?: number; limit?: number } = {}
+  ): Promise<ScannedStealthOutput[]> {
     const accountId = localAccountId(this.index);
     const provider = await this.getProvider();
     const viewSecret = await this.signer.getViewSecret();
@@ -2031,10 +2034,15 @@ export class OotleAccount implements WalletAccountApi {
 
     const pageSize = opts.pageSize ?? 50;
     const pageBudget = opts.maxPages ?? 10;
+    // Some resources (a voting template's ballot, a raffle ticket) mint at most one output per
+    // account by construction -- a caller that already knows this can pass `limit: 1` to stop the
+    // walk (both the page loop and the per-transaction fetches) the moment it's satisfied, rather
+    // than paying for however much of the budget happened to be left.
+    const limit = opts.limit ?? Infinity;
     let lastId: string | null = null;
     const found: ScannedStealthOutput[] = [];
 
-    for (let page = 0; page < pageBudget; page++) {
+    pages: for (let page = 0; page < pageBudget; page++) {
       const { transactions } = await provider.listRecentTransactions({ limit: pageSize, last_id: lastId, source: null });
       if (transactions.length === 0) break;
 
@@ -2063,6 +2071,7 @@ export class OotleAccount implements WalletAccountApi {
           await recordKnownShieldedOutput(accountId, resourceAddress, commitment, decrypted.value, entry.transaction_id, memo);
           knownCommitments.add(commitment);
           found.push({ resourceAddress, commitment, amount: decrypted.value, transactionId: entry.transaction_id, memo });
+          if (found.length >= limit) break pages;
         }
       }
       lastId = transactions[transactions.length - 1]!.transaction_id;
