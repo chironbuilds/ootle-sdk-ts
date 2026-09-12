@@ -23,6 +23,7 @@ import {
   resourceAddressLiteral,
   sealTransaction,
   sendTransaction,
+  serializeUnsignedTx,
   signTransaction,
   stealthUtxoSubstateId,
   submitTransaction,
@@ -1348,6 +1349,179 @@ export class OotleAccount implements WalletAccountApi {
     const response = await withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the redemption transaction");
     await recordKnownVersions(response);
     return { transactionId };
+  }
+
+  /**
+   * Like `redeemStealthOutputAndExecute`, but pays the transaction fee from a **second stealth
+   * UTXO** instead of this account's revealed balance — so the transaction never touches, and
+   * never reveals, this account's on-chain address at all. Confirmed live: the resulting
+   * transaction's `up_substates`/`down_substates` contain only the two stealth UTXOs, the
+   * redeemed resource, and whatever `relatedComponents` touch — no `component_...` belonging to
+   * this account appears anywhere in it.
+   *
+   * Required whenever the follow-up call itself carries information that would deanonymize the
+   * account if the fee input did (e.g. a voting ballot's ranking): a revealed fee input signs
+   * with this account's ordinary key, which links the transaction to the account exactly as
+   * plainly as if the whole thing were sent unshielded — see the confidential-rcv-template
+   * README's "Fee-from-stealth requirement (MUST)" for the canonical explanation.
+   *
+   * Both stealth inputs are spent via the same mechanism `redeemStealthOutputAndExecute` uses
+   * (KeyPath one-time-key ownership, resolved by decrypting each UTXO with this account's own
+   * view secret) — this method just does it twice, for two independent `StealthTransfer`
+   * instructions in the same transaction: the redeemed resource's spend carries the follow-up
+   * call (main instructions), the fee resource's spend carries `PayFeeFromBucket` (fee
+   * instructions, its own separate workspace scope — same convention as `followUpInstructions`,
+   * claims workspace id `0` there too).
+   *
+   * Neither stealth input's one-time key seals the transaction in the sense the protocol's
+   * `stealth_seal_with` API suggests one must — empirically (and consistent with how every other
+   * stealth-spending method in this file already works), the network accepts a transaction sealed
+   * by an arbitrary throwaway keypair as long as every stealth input's one-time-key authorization
+   * is signed with respect to that same seal key; `signTransaction` generates one automatically.
+   * Deliberately **omits** this account's own ordinary signature entirely (unlike every other
+   * stealth-spending method here, which signs with `mustSignWithAccountKey: true` by default) —
+   * adding it would attach the account's ordinary public key to the transaction, defeating the
+   * entire point of a stealth-funded fee.
+   *
+   * @param feeResourceAddress The fee-currency resource (almost always XTR/TARI).
+   * @param feeCommitmentHex A stealth UTXO of `feeResourceAddress` this account owns, with
+   *   enough value to cover `maxFee` — e.g. produced by this account's own `shield()` call
+   *   against `feeResourceAddress`. Consumed in full; the remainder above `maxFee` becomes a new
+   *   stealth change output back to this account.
+   * @returns `feeChangeCommitment` — the new stealth UTXO holding the fee input's unspent
+   *   remainder. There is no way to discover it other than being told, same as any other stealth
+   *   output belonging to this account that wasn't created by this account's own `shield()`
+   *   (which records its own outputs locally) — callers doing several of these in sequence must
+   *   thread this value into the next call's `feeCommitmentHex` themselves.
+   */
+  async redeemStealthOutputWithPrivateFee(
+    resourceAddress: string,
+    commitmentHex: string,
+    revealedAmount: bigint,
+    followUpInstructions: Instruction[],
+    feeResourceAddress: string,
+    feeCommitmentHex: string,
+    maxFee: bigint,
+    relatedComponents: string[] = []
+  ): Promise<{ transactionId: string; feeChangeCommitment: string }> {
+    if (revealedAmount <= 0n) throw new Error(`redeemStealthOutputWithPrivateFee: revealedAmount must be > 0, got ${revealedAmount}`);
+    if (maxFee <= 0n) throw new Error(`redeemStealthOutputWithPrivateFee: maxFee must be > 0, got ${maxFee}`);
+    const provider = await this.getProvider();
+    const crypto = new WasmStealthCrypto(this.network);
+    const walletAddress = await this.getWalletAddress();
+    const viewSecret = await this.signer.getViewSecret();
+
+    const decryptStealthInput = async (resource: string, commitmentHexIn: string) => {
+      const commitment = fromHex(commitmentHexIn);
+      const substateId = stealthUtxoSubstateId(resource, commitment);
+      const substate = await provider.getSubstate(substateId);
+      const decrypted = await decryptOwnedUtxo(crypto, viewSecret, substate, substateId);
+      if (!decrypted) {
+        throw new Error(`redeemStealthOutputWithPrivateFee: cannot decrypt ${substateId} -- it doesn't belong to this account, or is already spent.`);
+      }
+      return { commitmentHex: commitmentHexIn, substateId, mask: decrypted.mask, value: decrypted.value };
+    };
+
+    const redeemed = await decryptStealthInput(resourceAddress, commitmentHex);
+    const feeInput = await decryptStealthInput(feeResourceAddress, feeCommitmentHex);
+    if (feeInput.value <= maxFee) {
+      throw new Error(`redeemStealthOutputWithPrivateFee: fee UTXO (${feeInput.value}) is too small to cover maxFee (${maxFee})`);
+    }
+    const feeChange = feeInput.value - maxFee;
+
+    const inputSkeleton = (hex: string) => JSON.stringify({ inputs: [{ commitment: hex, witness: "KeyPath" }], revealed_amount: "0" });
+
+    // Redeemed resource: 1 stealth input -> 0 stealth outputs, fully revealed into the bucket
+    // `followUpInstructions` consumes.
+    const redeemedInputsStatement = new StealthInputsStatement([], 0n, inputSkeleton(redeemed.commitmentHex));
+    const redeemedOutputsStatement = new StealthOutputsStatement(
+      JSON.stringify({ outputs: [], revealed_output_amount: revealedAmount.toString(), agg_range_proof: "" })
+    );
+    const redeemedAggInputMask = await crypto.aggregateInputMasks([redeemed.mask]);
+    const redeemedBalanceProof = await crypto.generateBalanceProofSignature(
+      redeemedAggInputMask,
+      Mask.zero(),
+      redeemedInputsStatement.statementJson!,
+      redeemedOutputsStatement.statementJson
+    );
+    const redeemedStatement = new StealthTransferStatement(redeemedInputsStatement, redeemedOutputsStatement, redeemedBalanceProof);
+    await crypto.validateTransfer(redeemedStatement);
+
+    // Fee resource: 1 stealth input -> 1 stealth change output + revealed maxFee.
+    const feeChangeOutput = createOutput({ destination: walletAddress, amount: feeChange, resourceAddress: feeResourceAddress });
+    const { statement: feeOutputsStatement, outputMask: feeOutputMask } = await crypto.generateOutputsStatement([feeChangeOutput], maxFee);
+    const feeInputsStatement = new StealthInputsStatement([], 0n, inputSkeleton(feeInput.commitmentHex));
+    const feeAggInputMask = await crypto.aggregateInputMasks([feeInput.mask]);
+    const feeBalanceProof = await crypto.generateBalanceProofSignature(
+      feeAggInputMask,
+      feeOutputMask,
+      feeInputsStatement.statementJson!,
+      feeOutputsStatement.statementJson
+    );
+    const feeStatement = new StealthTransferStatement(feeInputsStatement, feeOutputsStatement, feeBalanceProof);
+    await crypto.validateTransfer(feeStatement);
+    const feeChangeCommitment = (feeOutputsStatement.parsed() as { outputs: { output: { commitment: string } }[] }).outputs[0]!.output.commitment;
+
+    const maxEpoch = await resolveMaxEpoch(provider);
+    const builder = TransactionBuilder.new(this.network, maxEpoch)
+      .addInstruction({
+        StealthTransfer: {
+          resource_address_ref: { Address: resourceAddress },
+          statement: { __ootleRawJson: redeemedStatement.toCompactJson() },
+          revealed_input_bucket: null,
+        },
+      } as unknown as Instruction)
+      .addInstruction({ PutLastInstructionOutputOnWorkspace: { key: 0 } } as unknown as Instruction)
+      .withInstructions(followUpInstructions)
+      .addFeeInstruction({
+        StealthTransfer: {
+          resource_address_ref: { Address: feeResourceAddress },
+          statement: { __ootleRawJson: feeStatement.toCompactJson() },
+          revealed_input_bucket: null,
+        },
+      } as unknown as Instruction)
+      .addFeeInstruction({ PutLastInstructionOutputOnWorkspace: { key: 0 } } as unknown as Instruction)
+      .addFeeInstruction({ PayFeeFromBucket: { bucket: { id: 0, offset: null } } } as unknown as Instruction)
+      .addInput({ substate_id: resourceAddress, version: null })
+      .addInput({ substate_id: redeemed.substateId, version: null })
+      .addInput({ substate_id: feeResourceAddress, version: null })
+      .addInput({ substate_id: feeInput.substateId, version: null });
+    for (const component of relatedComponents) {
+      builder.addInput({ substate_id: component, version: null });
+      for (const vaultId of await getVaultIdsForAccount(provider, component)) {
+        builder.addInput({ substate_id: vaultId, version: null });
+      }
+    }
+    const unsignedTx = await resolveTransaction(provider, builder.buildUnsignedTransaction());
+
+    // One addStealthSignature per stealth input, bound to a shared (arbitrary) seal key that
+    // signTransaction generates -- see this method's own doc comment for why no ordinary
+    // account-key signature is added.
+    const oneTimeSigner = (publicNonceHex: string) => ({
+      getAddress: async () => walletAddress,
+      getPublicKey: async () => parseOotleAddress(walletAddress).owner_key,
+      signTransaction: async (tx: UnsignedTransactionWithBlobs, sealPublicKey: Uint8Array) => {
+        const json = serializeUnsignedTx(tx);
+        const sig = await this.signer.addStealthSignature!(json, fromHex(publicNonceHex), sealPublicKey, { crypto });
+        return [sig];
+      },
+    });
+    // Each stealth input's own sender_public_nonce lives on its UTXO substate -- fetched again
+    // here (decryptOwnedUtxo above didn't return it) rather than parsed out of the substate
+    // response type, whose shape `decryptOwnedUtxo` already validated once.
+    const redeemedSubstate = await provider.getSubstate(redeemed.substateId);
+    const feeInputSubstate = await provider.getSubstate(feeInput.substateId);
+    const redeemedNonce = (redeemedSubstate as unknown as { substate: { Utxo: { output: { output: { public_nonce: string } } } } }).substate.Utxo
+      .output.output.public_nonce;
+    const feeNonce = (feeInputSubstate as unknown as { substate: { Utxo: { output: { output: { public_nonce: string } } } } }).substate.Utxo.output
+      .output.public_nonce;
+
+    const signed = await signTransaction([oneTimeSigner(redeemedNonce), oneTimeSigner(feeNonce)], unsignedTx);
+    const envelope = sealTransaction(signed);
+    const transactionId = await submitTransaction(provider, envelope);
+    const response = await withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the private-fee redemption transaction");
+    await recordKnownVersions(response);
+    return { transactionId, feeChangeCommitment };
   }
 
   /**
