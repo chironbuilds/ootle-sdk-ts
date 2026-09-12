@@ -99,11 +99,38 @@ async function write(patch: Partial<OotleState>): Promise<void> {
 
 let writeQueue: Promise<unknown> = Promise.resolve();
 
+// >0 while a callback passed to `serialized()` is actually running (including across its own
+// `await`s) -- lets a call from *inside* that callback detect it's nested and run immediately
+// instead of queuing behind a queue slot that can only advance once it finishes, which is a
+// deadlock (confirmed empirically: wallet.ts's recordKnownVersions() used to wrap a call to
+// setKnownVersions() -- which serializes its own write -- in its own serialized() block; the
+// inner call waited for the outer call's queue slot to free up, which was itself awaiting the
+// inner call). Safe for genuinely concurrent (non-nested) callers: `depth` is only ever
+// incremented inside the deferred callback below, never at the synchronous call site, so two
+// unrelated top-level `serialized()` calls dispatched back-to-back both see `depth === 0` and
+// queue normally regardless of how their execution ends up overlapping in time -- this only ever
+// fires for a call genuinely reachable from within an already-running callback's own call graph.
+let depth = 0;
+
 /** Runs a whole read-modify-write cycle to completion before the next one starts, so two
  * concurrent callers (two tabs, a page request racing a popup request) can't interleave their
- * read-modify-write on this key and silently clobber each other's write. */
+ * read-modify-write on this key and silently clobber each other's write.
+ *
+ * Never nest a call to this (or to another function that itself calls this, like every setter in
+ * this file) inside a `serialized()` callback if you can avoid it -- the fallback above keeps it
+ * from deadlocking, but the nested call then runs *outside* the ordering guarantee this exists to
+ * provide. */
 export function serialized<T>(fn: () => Promise<T>): Promise<T> {
-  const result = writeQueue.then(fn, fn);
+  if (depth > 0) return fn();
+  const run = async () => {
+    depth++;
+    try {
+      return await fn();
+    } finally {
+      depth--;
+    }
+  };
+  const result = writeQueue.then(run, run);
   writeQueue = result.then(
     () => undefined,
     () => undefined,

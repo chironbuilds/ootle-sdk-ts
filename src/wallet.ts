@@ -64,7 +64,6 @@ import {
   localAccountId,
   markShieldedOutputSpent,
   removePendingShield,
-  serialized,
   setKnownVersions,
   setPrivatePaymentScanCursor,
 } from "./storage.js";
@@ -2127,15 +2126,17 @@ async function recordKnownVersions(response: IndexerGetTransactionResultResponse
   const updates = new Map<string, number>();
   for (const [id, substate] of upSubstates) updates.set(id, substate.version);
 
-  // Serialized through the same write queue as every other storage mutation (see storage.ts's
-  // `serialized`) so two concurrent confirmations can't interleave their read-modify-write on
-  // this key and lose an update, and so this write can't race a wallet wipe to leave stale version
-  // numbers behind.
-  await serialized(async () => {
-    const known = await loadKnownVersions();
-    for (const [id, version] of updates) known.set(id, version);
-    await setKnownVersions(Object.fromEntries(known));
-  });
+  // No extra `serialized()` wrap needed here (and one would deadlock: `setKnownVersions` below
+  // already serializes its own write against storage.ts's shared queue, and queuing this whole
+  // function behind that same queue would make it wait on a write that is itself waiting for this
+  // function to finish). `loadKnownVersions()` returns the same cached, shared Map every time
+  // (mutated in place, never replaced), so two concurrent confirmations both mutate one object
+  // synchronously — no read-modify-write race to protect against — and whichever of their
+  // `setKnownVersions` writes lands last still snapshots the *fully* merged map at that point, so
+  // nothing is lost regardless of write order.
+  const known = await loadKnownVersions();
+  for (const [id, version] of updates) known.set(id, version);
+  await setKnownVersions(Object.fromEntries(known));
 }
 
 /**

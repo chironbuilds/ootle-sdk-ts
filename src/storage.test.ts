@@ -10,6 +10,7 @@ import {
   listShieldedOutputs,
   markShieldedOutputSpent,
   removePendingShield,
+  serialized,
   setKnownVersions,
   setPrivatePaymentScanCursor,
   wipeOotleState,
@@ -88,5 +89,21 @@ describe("storage (KeyValueStore-backed)", () => {
 
     expect(await listShieldedOutputs("local:0")).toEqual([]);
     expect(await getKnownVersions()).toEqual({});
+  });
+
+  // Regression test for a real deadlock: wallet.ts's recordKnownVersions() used to wrap a call to
+  // setKnownVersions() in its own serialized() block. Since setKnownVersions() already serializes
+  // its own write against this same module-level queue, that nested call waited on a queue slot
+  // that could only advance once it finished -- classic self-deadlock. Any caller doing the same
+  // thing (queuing a callback that calls another serialized function) must not hang.
+  it("does not deadlock when a serialized callback calls another serialized function", async () => {
+    const resolved = await Promise.race([
+      serialized(async () => {
+        await setKnownVersions({ vault_a: 1 });
+      }).then(() => "resolved"),
+      new Promise((resolve) => setTimeout(() => resolve("timed out"), 500)),
+    ]);
+    expect(resolved).toBe("resolved");
+    expect(await getKnownVersions()).toEqual({ vault_a: 1 });
   });
 });
