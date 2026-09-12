@@ -500,7 +500,7 @@ export class OotleAccount implements WalletAccountApi {
         if (opts.dryRun) return await withTimeout(this.submitDryRun(provider, unsignedTx), 30_000, "submitting the transaction");
         const result = await withTimeout(this.submitReal(provider, unsignedTx), 60_000, "submitting the transaction");
         await recordKnownVersions(result);
-        return result;
+        return withTransactionId(result);
       } catch (e) {
         if (!(e instanceof Error) || attempt >= maxRetries) throw e;
 
@@ -2438,6 +2438,23 @@ async function recordKnownVersions(response: IndexerGetTransactionResultResponse
   const known = await loadKnownVersions();
   for (const [id, version] of updates) known.set(id, version);
   await setKnownVersions(Object.fromEntries(known));
+}
+
+/**
+ * `execute()`'s raw submit result has no top-level `transactionId` -- unlike the SDK's own custom
+ * operations (`shield`, `redeemStealthOutputAndExecute`, etc.), which all return that field
+ * explicitly. dApp code built against those was reasonably reaching for `result.transactionId` on
+ * `execute()`'s result too and finding nothing there. This tacks the same field on, non-destructively
+ * (spread first, so a genuine future `transactionId` in the response itself would win), reading the
+ * hash out of the one place it actually lives: `Finalized.execution_result.finalize.transaction_hash`.
+ * Left untouched for "Pending"/"Rejected" outcomes and for a null `execution_result` (e.g. a
+ * `Rejected`-at-the-fee-phase finalize) -- there is no hash to report for those.
+ */
+function withTransactionId<T extends IndexerGetTransactionResultResponse>(response: T): T & { transactionId?: string } {
+  const result = response.result;
+  if (result === "Pending" || "Rejected" in result) return response;
+  const transactionHash = result.Finalized.execution_result?.finalize.transaction_hash;
+  return transactionHash !== undefined ? { ...response, transactionId: transactionHash } : response;
 }
 
 /**
