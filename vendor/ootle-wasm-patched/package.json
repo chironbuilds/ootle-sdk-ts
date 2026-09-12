@@ -1,0 +1,27 @@
+{
+  "name": "@tari-project/ootle-wasm",
+  "type": "module",
+  "collaborators": [
+    "The Tari Development Community"
+  ],
+  "description": "WASM bindings for Tari Ootle client-side crypto — thin wasm-bindgen shell over ootle-wasm-core. LOCAL VENDOR PATCH: adds createConfidentialWithdrawProofLiteral, built from tari-dan crates/ootle_wasm at commit 472794e plus the confidential.rs module added on top -- not yet in an upstream release.",
+  "version": "0.39.4",
+  "license": "BSD-3-Clause",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tari-project/tari-ootle"
+  },
+  "files": [
+    "ootle_wasm_bg.wasm",
+    "ootle_wasm.js",
+    "ootle_wasm_bg.js",
+    "ootle_wasm.d.ts",
+    "README.md"
+  ],
+  "main": "ootle_wasm.js",
+  "types": "ootle_wasm.d.ts",
+  "sideEffects": [
+    "./ootle_wasm.js",
+    "./snippets/*"
+  ]
+}

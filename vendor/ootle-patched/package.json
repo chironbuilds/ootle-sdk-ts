@@ -1,0 +1,23 @@
+{
+  "name": "@tari-project/ootle",
+  "version": "0.3.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "browser": "./dist/index.js",
+      "node": "./dist/index.js",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@tari-project/ootle-ts-bindings": "^1.49.1",
+    "@tari-project/ootle-wasm": "^0.39.1"
+  }
+}

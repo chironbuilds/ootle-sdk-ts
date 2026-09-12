@@ -1,0 +1,46 @@
+{
+  "name": "@chironbuilds/ootle-sdk",
+  "version": "0.1.0",
+  "description": "Shared TypeScript client for Tari Ootle (L2): account derivation, balances, transactions, HTLCs, and stealth/confidential transfers — the account core behind Sapient and the Tari L1 web wallet's Ootle support.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chironbuilds/ootle-sdk-ts.git"
+  },
+  "homepage": "https://github.com/chironbuilds/ootle-sdk-ts",
+  "keywords": ["tari", "ootle", "wallet", "blockchain", "web3"],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./adapters": {
+      "types": "./dist/adapters.d.ts",
+      "default": "./dist/adapters.js"
+    }
+  },
+  "files": ["dist", "vendor"],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@noble/curves": "^1.9.0",
+    "@noble/hashes": "^2.2.0",
+    "@tari-project/ootle": "file:./vendor/ootle-patched",
+    "@tari-project/ootle-indexer": "^0.3.0",
+    "@tari-project/ootle-secret-key-wallet": "^0.3.0",
+    "@tari-project/ootle-ts-bindings": "^1.49.1",
+    "@tari-project/ootle-wasm": "file:./vendor/ootle-wasm-patched"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.280",
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.0"
+  }
+}
