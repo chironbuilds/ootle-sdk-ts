@@ -2022,7 +2022,7 @@ export class OotleAccount implements WalletAccountApi {
    */
   async scanForResourceUtxos(
     resourceAddress: string,
-    opts: { maxPages?: number; pageSize?: number; limit?: number } = {}
+    opts: { maxPages?: number; pageSize?: number; limit?: number; transactionIds?: string[] } = {}
   ): Promise<ScannedStealthOutput[]> {
     const accountId = localAccountId(this.index);
     const provider = await this.getProvider();
@@ -2031,48 +2031,77 @@ export class OotleAccount implements WalletAccountApi {
     const known = await listShieldedOutputs(accountId);
     const knownCommitments = new Set(known.filter((r) => r.resourceAddress === resourceAddress).map((r) => r.commitment));
     const prefix = `utxo_${resourceAddress.startsWith("resource_") ? resourceAddress.slice(9) : resourceAddress}_`;
+    // Some resources (a voting template's ballot, a raffle ticket) mint at most one output per
+    // account by construction -- a caller that already knows this can pass `limit: 1` to stop the
+    // walk the moment it's satisfied, rather than paying for however much of the budget happened
+    // to be left.
+    const limit = opts.limit ?? Infinity;
+    const found: ScannedStealthOutput[] = [];
+
+    // Checks one already-known transaction id for a matching output. Failures here (a 404 for a
+    // transaction the indexer hasn't finished materializing a full result for yet, a transient
+    // network error, whatever) are swallowed and treated as "nothing found in this one" rather than
+    // aborting the entire scan -- confirmed necessary empirically: a single bad lookup among dozens
+    // in a page used to fail the whole call, forcing a full retry from scratch for something that
+    // would otherwise have kept going and found the real match a few transactions later.
+    const checkTransaction = async (transactionId: string): Promise<void> => {
+      let response;
+      try {
+        response = await provider.getTransactionResult(transactionId);
+      } catch {
+        return;
+      }
+      const result = response.result;
+      if (result === "Pending" || "Rejected" in result) return;
+      const outcome = result.Finalized.execution_result?.finalize.result;
+      const upSubstates =
+        outcome && typeof outcome === "object" && "Accept" in outcome
+          ? outcome.Accept.up_substates
+          : outcome && typeof outcome === "object" && "AcceptFeeRejectRest" in outcome
+            ? outcome.AcceptFeeRejectRest[0].up_substates
+            : undefined;
+      if (!upSubstates) return;
+
+      for (const [substateId, substate] of upSubstates) {
+        if (!substateId.startsWith(prefix)) continue;
+        const commitment = substateId.slice(prefix.length);
+        if (knownCommitments.has(commitment)) continue;
+        const decrypted = await decryptOwnedUtxo(crypto, viewSecret, { ...substate, verified: true }, substateId);
+        if (!decrypted) continue;
+        const memo = fromMemo(decrypted.memo);
+        await recordKnownShieldedOutput(accountId, resourceAddress, commitment, decrypted.value, transactionId, memo);
+        knownCommitments.add(commitment);
+        found.push({ resourceAddress, commitment, amount: decrypted.value, transactionId, memo });
+        if (found.length >= limit) return;
+      }
+    };
+
+    // Targeted path: when the caller already knows exactly where this resource's outputs were
+    // created (e.g. a voting app's own election-creation transaction id, which is exactly where
+    // every ballot for that election was minted), check those directly instead of ever touching
+    // `listRecentTransactions` -- turns an O(recent chain history) walk into O(len(transactionIds))
+    // direct lookups.
+    for (const transactionId of opts.transactionIds ?? []) {
+      await checkTransaction(transactionId);
+      if (found.length >= limit) return found;
+    }
+    if (found.length > 0 && opts.transactionIds?.length) return found;
 
     const pageSize = opts.pageSize ?? 50;
     const pageBudget = opts.maxPages ?? 10;
-    // Some resources (a voting template's ballot, a raffle ticket) mint at most one output per
-    // account by construction -- a caller that already knows this can pass `limit: 1` to stop the
-    // walk (both the page loop and the per-transaction fetches) the moment it's satisfied, rather
-    // than paying for however much of the budget happened to be left.
-    const limit = opts.limit ?? Infinity;
+    const alreadyChecked = new Set(opts.transactionIds ?? []);
     let lastId: string | null = null;
-    const found: ScannedStealthOutput[] = [];
 
-    pages: for (let page = 0; page < pageBudget; page++) {
+    for (let page = 0; page < pageBudget; page++) {
       const { transactions } = await provider.listRecentTransactions({ limit: pageSize, last_id: lastId, source: null });
       if (transactions.length === 0) break;
 
       for (const entry of transactions) {
         // No receipt yet, or rejected at mempool submission -- neither ever produced up_substates.
         if (entry.rejected_reason !== null || !entry.summary) continue;
-        const response = await provider.getTransactionResult(entry.transaction_id);
-        const result = response.result;
-        if (result === "Pending" || "Rejected" in result) continue;
-        const outcome = result.Finalized.execution_result?.finalize.result;
-        const upSubstates =
-          outcome && typeof outcome === "object" && "Accept" in outcome
-            ? outcome.Accept.up_substates
-            : outcome && typeof outcome === "object" && "AcceptFeeRejectRest" in outcome
-              ? outcome.AcceptFeeRejectRest[0].up_substates
-              : undefined;
-        if (!upSubstates) continue;
-
-        for (const [substateId, substate] of upSubstates) {
-          if (!substateId.startsWith(prefix)) continue;
-          const commitment = substateId.slice(prefix.length);
-          if (knownCommitments.has(commitment)) continue;
-          const decrypted = await decryptOwnedUtxo(crypto, viewSecret, { ...substate, verified: true }, substateId);
-          if (!decrypted) continue;
-          const memo = fromMemo(decrypted.memo);
-          await recordKnownShieldedOutput(accountId, resourceAddress, commitment, decrypted.value, entry.transaction_id, memo);
-          knownCommitments.add(commitment);
-          found.push({ resourceAddress, commitment, amount: decrypted.value, transactionId: entry.transaction_id, memo });
-          if (found.length >= limit) break pages;
-        }
+        if (alreadyChecked.has(entry.transaction_id)) continue;
+        await checkTransaction(entry.transaction_id);
+        if (found.length >= limit) return found;
       }
       lastId = transactions[transactions.length - 1]!.transaction_id;
     }
