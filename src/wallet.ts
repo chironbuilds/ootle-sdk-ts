@@ -1998,6 +1998,77 @@ export class OotleAccount implements WalletAccountApi {
     if (newestSeen && reachedCursor) await setPrivatePaymentScanCursor(accountId, newestSeen);
     return { claimed: found.length, found };
   }
+
+  /**
+   * Given a resource address, finds every UTXO of that resource type this account can decrypt
+   * with its own view key, no matter which instruction created it -- unlike
+   * `scanForPrivatePayments()`, which only ever recognizes outputs from a top-level native
+   * `StealthTransfer` instruction and so misses anything minted by custom template logic inside a
+   * `CallFunction`/`CallMethod` (a voting template's ballot tokens, for instance -- confirmed this
+   * is exactly why a voter's wallet can't discover an RCV ballot on its own).
+   *
+   * There is no indexer API to list substates by resource address: `Provider.getSubstate()` and
+   * `getStealthUtxo()` both need a specific id/commitment already in hand, and
+   * `listRecentTransactions()`'s pruned `TransactionEntry.summary` carries only a
+   * `Commit`/`FeeIntentCommit` flag, never the actual `up_substates` diff (confirmed by reading
+   * `TransactionResultSummary`'s own type). So this walks recent transaction ids and fetches each
+   * one's *full* result via `getTransactionResult()` -- one extra round trip per transaction,
+   * unlike `scanForPrivatePayments()`'s single-request-per-page listing -- filtering for
+   * `utxo_{resource}_...` substate ids before ever attempting a decrypt. This is expensive by
+   * construction (there is no cheaper way to ask "does resource X have any output for me" without
+   * the indexer itself indexing by resource), so it takes no cursor and defaults to a small,
+   * bounded lookback -- meant for an interactive "do I have one of these" check on a resource
+   * whose mint is known to be recent, not a background sweep of the whole chain.
+   */
+  async scanForResourceUtxos(resourceAddress: string, opts: { maxPages?: number; pageSize?: number } = {}): Promise<ScannedStealthOutput[]> {
+    const accountId = localAccountId(this.index);
+    const provider = await this.getProvider();
+    const viewSecret = await this.signer.getViewSecret();
+    const crypto = new WasmStealthCrypto(this.network);
+    const known = await listShieldedOutputs(accountId);
+    const knownCommitments = new Set(known.filter((r) => r.resourceAddress === resourceAddress).map((r) => r.commitment));
+    const prefix = `utxo_${resourceAddress.startsWith("resource_") ? resourceAddress.slice(9) : resourceAddress}_`;
+
+    const pageSize = opts.pageSize ?? 50;
+    const pageBudget = opts.maxPages ?? 10;
+    let lastId: string | null = null;
+    const found: ScannedStealthOutput[] = [];
+
+    for (let page = 0; page < pageBudget; page++) {
+      const { transactions } = await provider.listRecentTransactions({ limit: pageSize, last_id: lastId, source: null });
+      if (transactions.length === 0) break;
+
+      for (const entry of transactions) {
+        // No receipt yet, or rejected at mempool submission -- neither ever produced up_substates.
+        if (entry.rejected_reason !== null || !entry.summary) continue;
+        const response = await provider.getTransactionResult(entry.transaction_id);
+        const result = response.result;
+        if (result === "Pending" || "Rejected" in result) continue;
+        const outcome = result.Finalized.execution_result?.finalize.result;
+        const upSubstates =
+          outcome && typeof outcome === "object" && "Accept" in outcome
+            ? outcome.Accept.up_substates
+            : outcome && typeof outcome === "object" && "AcceptFeeRejectRest" in outcome
+              ? outcome.AcceptFeeRejectRest[0].up_substates
+              : undefined;
+        if (!upSubstates) continue;
+
+        for (const [substateId, substate] of upSubstates) {
+          if (!substateId.startsWith(prefix)) continue;
+          const commitment = substateId.slice(prefix.length);
+          if (knownCommitments.has(commitment)) continue;
+          const decrypted = await decryptOwnedUtxo(crypto, viewSecret, { ...substate, verified: true }, substateId);
+          if (!decrypted) continue;
+          const memo = fromMemo(decrypted.memo);
+          await recordKnownShieldedOutput(accountId, resourceAddress, commitment, decrypted.value, entry.transaction_id, memo);
+          knownCommitments.add(commitment);
+          found.push({ resourceAddress, commitment, amount: decrypted.value, transactionId: entry.transaction_id, memo });
+        }
+      }
+      lastId = transactions[transactions.length - 1]!.transaction_id;
+    }
+    return found;
+  }
 }
 
 /**
