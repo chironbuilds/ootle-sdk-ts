@@ -10,7 +10,7 @@
 // against `@tari-project/ootle`'s own type signatures before writing this, not assumed.
 import { decryptInputData, type StealthCryptoProvider } from "@tari-project/ootle";
 import type { OutputBody, TransactionEntry } from "@tari-project/ootle-ts-bindings";
-import { fromHex } from "./vault";
+import { fromHex } from "./vault.js";
 
 export interface ConfidentialSumResult {
   /** Total plaintext value recovered across every commitment this account could decrypt. */

@@ -46,14 +46,14 @@ import {
   stealthDhSecret,
   validateStealthTransfer,
 } from "@tari-project/ootle-wasm";
-import type { WalletAccountApi } from "./accountApi";
-import { componentAddressFromWalletAddress, deriveAccountComponentAddress } from "./componentAddress";
-import { scanTransactionsForOwnedOutputs, sumConfidentialCommitments } from "./confidential";
-import type { ScannedStealthOutput } from "./confidential";
-import { deriveAccountKeys } from "./derivation";
-import { htlcConditions } from "./htlc";
-import { buildOwnershipProofMessage, buildWalletOwnershipMessage } from "./ownershipProof";
-import { type NetworkName, toOotleNetwork } from "./ootleNetwork";
+import type { WalletAccountApi } from "./accountApi.js";
+import { componentAddressFromWalletAddress, deriveAccountComponentAddress } from "./componentAddress.js";
+import { scanTransactionsForOwnedOutputs, sumConfidentialCommitments } from "./confidential.js";
+import type { ScannedStealthOutput } from "./confidential.js";
+import { deriveAccountKeys } from "./derivation.js";
+import { htlcConditions } from "./htlc.js";
+import { buildOwnershipProofMessage, buildWalletOwnershipMessage } from "./ownershipProof.js";
+import { type NetworkName, toOotleNetwork } from "./ootleNetwork.js";
 import {
   addPendingShield,
   addShieldedOutput,
@@ -67,10 +67,10 @@ import {
   serialized,
   setKnownVersions,
   setPrivatePaymentScanCursor,
-} from "./storage";
-import type { ShieldedOutputRecord } from "./storage";
-import { withTimeout } from "./timeout";
-import { fromHex, toHex } from "./vault";
+} from "./storage.js";
+import type { ShieldedOutputRecord } from "./storage.js";
+import { withTimeout } from "./timeout.js";
+import { fromHex, toHex } from "./vault.js";
 
 export interface TokenBalance {
   resourceAddress: string;

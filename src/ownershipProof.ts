@@ -16,7 +16,7 @@
 // ownershipProof.test.ts and tari-paylink-dapp's scripts/verify-schnorr-roundtrip.mjs, which this
 // construction must stay byte-identical to.
 import { utf8ToBytes } from "@noble/hashes/utils.js";
-import { DomainSeparatedHasher } from "./domainHash";
+import { DomainSeparatedHasher } from "./domainHash.js";
 
 const OWNERSHIP_PROOF_DOMAIN = "com.tari.paylink.ownership_proof";
 const OWNERSHIP_PROOF_VERSION = 1;

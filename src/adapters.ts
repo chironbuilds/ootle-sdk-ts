@@ -2,7 +2,7 @@
 // `configureOotleStorage()` once at startup; write your own for any other host (see the interface
 // in storage.ts -- it's three methods).
 
-import type { KeyValueStore } from "./storage";
+import type { KeyValueStore } from "./storage.js";
 
 /** For a Chrome (or any Manifest V3) extension. `chrome.storage.local` already stores structured
  * values natively, so this is a thin wrapper, not a serializer. */

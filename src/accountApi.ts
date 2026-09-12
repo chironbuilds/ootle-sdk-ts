@@ -1,6 +1,6 @@
 import type { IndexerProvider } from "@tari-project/ootle-indexer";
 import type { Instruction, SubstateRequirement } from "@tari-project/ootle-ts-bindings";
-import type { TokenBalance } from "./wallet";
+import type { TokenBalance } from "./wallet.js";
 
 export interface TransactionExecuteOpts {
   maxFee?: bigint;

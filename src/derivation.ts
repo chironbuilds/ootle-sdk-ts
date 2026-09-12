@@ -9,7 +9,7 @@
 // the Ristretto group order. Branch strings ("account" / "view_only_key") are
 // `KeyBranch::as_str()` (tari-ootle's `crates/wallet/sdk/src/models/key.rs`).
 import { utf8ToBytes } from "@noble/hashes/utils.js";
-import { keyManagerDomainHasher } from "./domainHash";
+import { keyManagerDomainHasher } from "./domainHash.js";
 
 // The Ristretto255 / Ed25519 group order l = 2^252 + 27742317777372353535851937790883648493.
 const GROUP_ORDER = (1n << 252n) + 27742317777372353535851937790883648493n;

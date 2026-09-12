@@ -1,4 +1,4 @@
-# @chironbuilds/ootle-sdk
+# @chironbuilder/ootle-sdk
 
 A shared TypeScript client for [Tari Ootle](https://github.com/tari-project/tari-ootle) (L2): account
 derivation, balances, transaction building/submission with automatic input resolution, HTLCs, and
@@ -17,7 +17,7 @@ wallets above (they still carry their own local copies for now). Treat `0.x` as 
 ## Install
 
 ```bash
-npm install @chironbuilds/ootle-sdk
+npm install @chironbuilder/ootle-sdk
 ```
 
 This package vendors two small, still-unmerged patches: `@tari-project/ootle` (a `covenant_claims`
@@ -33,8 +33,8 @@ The SDK never touches a concrete storage API directly. It reads and writes throu
 `KeyValueStore` interface — configure one adapter, once, before calling anything else:
 
 ```ts
-import { configureOotleStorage } from "@chironbuilds/ootle-sdk";
-import { chromeStorageAdapter } from "@chironbuilds/ootle-sdk/adapters";
+import { configureOotleStorage } from "@chironbuilder/ootle-sdk";
+import { chromeStorageAdapter } from "@chironbuilder/ootle-sdk/adapters";
 // or: localStorageAdapter, inMemoryAdapter (tests)
 
 configureOotleStorage(chromeStorageAdapter());
@@ -50,7 +50,7 @@ very different shapes per host — keep those in your own app's storage layer.
 ## Usage
 
 ```ts
-import { OotleAccount, toOotleNetwork } from "@chironbuilds/ootle-sdk";
+import { OotleAccount, toOotleNetwork } from "@chironbuilder/ootle-sdk";
 
 const account = OotleAccount.fromSeed(entropy, /* index */ 0, "esmeralda");
 
