@@ -1,6 +1,6 @@
 {
   "name": "@chironbuilder/ootle-sdk",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "Shared TypeScript client for Tari Ootle (L2): account derivation, balances, transactions, HTLCs, and stealth/confidential transfers — the account core behind Sapient and the Tari L1 web wallet's Ootle support.",
   "type": "module",
   "license": "MIT",
