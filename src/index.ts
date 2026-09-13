@@ -51,7 +51,7 @@ export {
 
 export { chromeStorageAdapter, inMemoryAdapter, localStorageAdapter } from "./adapters.js";
 
-export type { PrivateBalance, TokenBalance } from "./wallet.js";
+export type { FeeType, PrivateBalance, TokenBalance } from "./wallet.js";
 export {
   OotleAccount,
   assertValidMinimumValuePromise,
@@ -65,6 +65,7 @@ export {
   resolveInputsWithRetry,
   resolveSendPrivatelyPlan,
   resolveUnshieldPlan,
+  selectPrivateFeeUtxo,
   selectShieldedUtxosForAmount,
   selectUnspentShieldedOutputs,
   substateExists,

@@ -10,6 +10,7 @@ import {
   resolveInputsWithRetry,
   resolveSendPrivatelyPlan,
   resolveUnshieldPlan,
+  selectPrivateFeeUtxo,
   selectShieldedUtxosForAmount,
   selectUnspentShieldedOutputs,
   substateExists,
@@ -336,6 +337,44 @@ describe("resolveUnshieldPlan", () => {
     const record = fakeRecord({ amount: "100" });
     const { remainder } = resolveUnshieldPlan([record], record.resourceAddress, 99n);
     expect(remainder).toBe(1n);
+  });
+});
+
+describe("selectPrivateFeeUtxo", () => {
+  it("picks the smallest unspent record that alone covers maxFee", () => {
+    const small = fakeRecord({ commitment: "aa".repeat(32), amount: "1000" });
+    const large = fakeRecord({ commitment: "bb".repeat(32), amount: "5000" });
+    const chosen = selectPrivateFeeUtxo([large, small], small.resourceAddress, 500n);
+    expect(chosen.commitment).toBe(small.commitment);
+  });
+
+  it("skips a record too small to cover maxFee alone", () => {
+    const tooSmall = fakeRecord({ commitment: "aa".repeat(32), amount: "500" });
+    const justEnough = fakeRecord({ commitment: "bb".repeat(32), amount: "501" });
+    const chosen = selectPrivateFeeUtxo([tooSmall, justEnough], tooSmall.resourceAddress, 500n);
+    expect(chosen.commitment).toBe(justEnough.commitment);
+  });
+
+  it("ignores spent records and records of a different resource", () => {
+    const spent = fakeRecord({ commitment: "aa".repeat(32), amount: "1000", spent: true });
+    const otherResource = fakeRecord({ commitment: "bb".repeat(32), amount: "1000", resourceAddress: "resource_other" });
+    const eligible = fakeRecord({ commitment: "cc".repeat(32), amount: "1000" });
+    const chosen = selectPrivateFeeUtxo([spent, otherResource, eligible], eligible.resourceAddress, 500n);
+    expect(chosen.commitment).toBe(eligible.commitment);
+  });
+
+  it("throws when no single record covers maxFee", () => {
+    const record = fakeRecord({ amount: "500" });
+    expect(() => selectPrivateFeeUtxo([record], record.resourceAddress, 500n)).toThrow(
+      "No single shielded resource_xtr UTXO is large enough to cover a private fee of 500."
+    );
+  });
+
+  it("requires the record's amount to strictly exceed maxFee, not just equal it", () => {
+    const record = fakeRecord({ amount: "500" });
+    expect(() => selectPrivateFeeUtxo([record], record.resourceAddress, 500n)).toThrow();
+    const bigEnough = fakeRecord({ amount: "501" });
+    expect(selectPrivateFeeUtxo([bigEnough], bigEnough.resourceAddress, 500n).commitment).toBe(bigEnough.commitment);
   });
 });
 

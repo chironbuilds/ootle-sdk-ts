@@ -1,12 +1,17 @@
 import type { IndexerProvider } from "@tari-project/ootle-indexer";
 import type { Instruction, SubstateRequirement } from "@tari-project/ootle-ts-bindings";
-import type { TokenBalance } from "./wallet.js";
+import type { FeeType, TokenBalance } from "./wallet.js";
 
 export interface TransactionExecuteOpts {
   maxFee?: bigint;
   dryRun?: boolean;
   inputs?: SubstateRequirement[];
   maxRetries?: number;
+  /** See `FeeType`'s own doc comment. `OotleAccount` honors this; a `DaemonAccount`
+   * (walletd-relayed) implementation of this interface must implement its own support or
+   * explicitly reject `{ kind: "private" }` -- there is no default private-fee behavior a shared
+   * interface can provide for a backend this package doesn't talk to. */
+  feeType?: FeeType;
 }
 
 /**
@@ -29,6 +34,6 @@ export interface WalletAccountApi {
    * requires the owner public key the wallet address encodes; a bare component address never
    * reveals it, so that form can only pay an account that already exists). Prefer asking senders
    * for the wallet address — it's the one form that always works. */
-  send(recipientAddress: string, resourceAddress: string, amount: bigint, maxFee?: bigint): Promise<unknown>;
+  send(recipientAddress: string, resourceAddress: string, amount: bigint, maxFee?: bigint, feeType?: FeeType): Promise<unknown>;
   claimTestnetXtr(): Promise<unknown>;
 }

@@ -28,7 +28,7 @@ import {
   stealthUtxoSubstateId,
   submitTransaction,
 } from "@tari-project/ootle";
-import type { StealthTransferSpec, UnsignedTransactionWithBlobs } from "@tari-project/ootle";
+import type { AuthorizedTransfer, Signer, StealthTransferSpec, UnsignedTransactionWithBlobs } from "@tari-project/ootle";
 import type {
   ExecuteResult,
   IndexerGetTransactionResultResponse,
@@ -76,6 +76,23 @@ import {
 import type { ShieldedOutputRecord } from "./storage.js";
 import { withTimeout } from "./timeout.js";
 import { fromHex, toHex } from "./vault.js";
+
+/** How a transaction's fee is paid. Defaults to `transparent` everywhere (unchanged behavior:
+ * revealed balance, reveals the paying account on-chain). `private` instead spends a stealth
+ * UTXO of `feeResourceAddress` -- see `OotleAccount.buildPrivateFeeInstructions`'s doc comment
+ * for why this is single-UTXO only, and `selectPrivateFeeUtxo` for how one is chosen. */
+export type FeeType = { kind: "transparent" } | { kind: "private"; feeResourceAddress: string };
+
+/** Everything needed to attach and later account for a private fee spend, produced by
+ * `OotleAccount.buildPrivateFeeInstructions` plus the UTXO it consumed. */
+type PrivateFeeMaterial = {
+  feeInstructions: Instruction[];
+  feeInputs: SubstateRequirement[];
+  feeChangeCommitment: string;
+  feeChangeAmount: bigint;
+  feeSigner: Signer;
+  spentCommitment: string;
+};
 
 export interface TokenBalance {
   resourceAddress: string;
@@ -468,11 +485,26 @@ export class OotleAccount implements WalletAccountApi {
    */
   async execute(
     instructions: Instruction[],
-    opts: { maxFee?: bigint; dryRun?: boolean; inputs?: SubstateRequirement[]; maxRetries?: number } = {}
+    opts: {
+      maxFee?: bigint;
+      dryRun?: boolean;
+      inputs?: SubstateRequirement[];
+      maxRetries?: number;
+      /**
+       * Defaults to `{ kind: "transparent" }` (unchanged behavior: fee paid from the account's
+       * revealed balance, which reveals `account` on-chain). `{ kind: "private" }` instead pays
+       * from a shielded UTXO of `feeResourceAddress`, auto-selected via `selectPrivateFeeUtxo`
+       * (smallest unspent record that alone covers `maxFee` -- shield some first if none
+       * qualifies) -- see `buildPrivateFeeInstructions`'s doc comment for why this is
+       * single-UTXO only. `dryRun` never touches local storage even when private.
+       */
+      feeType?: FeeType;
+    } = {}
   ) {
     const provider = await this.getProvider();
     const account = await this.getComponentAddress();
     const maxFee = opts.maxFee ?? 5000n;
+    const feeType = opts.feeType ?? { kind: "transparent" as const };
     // Resolved once, outside the retry loop below: every transaction now carries a mandatory
     // `max_epoch`, and a fresh chain-tip lookup on every retry would buy nothing (the loop's
     // whole retry budget runs in well under an epoch in practice) at the cost of an extra
@@ -489,17 +521,31 @@ export class OotleAccount implements WalletAccountApi {
     const seenAddresses = new Set<string>();
     let inputs = await applyKnownVersions(opts.inputs ? [...opts.inputs] : []);
 
+    // Built once, outside the retry loop, like `maxEpoch` above: the fee stealth proof doesn't
+    // depend on which main-instruction substates a given attempt discovers, so redoing the
+    // indexer round trip + proof generation on every retry would buy nothing.
+    const accountId = localAccountId(this.index);
+    const privateFee = await this.resolvePrivateFee(feeType, maxFee);
+
     for (let attempt = 0; ; attempt++) {
-      const builder = TransactionBuilder.new(this.network, maxEpoch)
-        .withInstructions(instructions)
-        .feeTransactionPayFromComponent(account, maxFee);
+      const builder = TransactionBuilder.new(this.network, maxEpoch).withInstructions(instructions);
+      if (privateFee) {
+        for (const instr of privateFee.feeInstructions) builder.addFeeInstruction(instr);
+      } else {
+        builder.feeTransactionPayFromComponent(account, maxFee);
+      }
       if (inputs.length) builder.withInputs(inputs);
+      if (privateFee) builder.withInputs(privateFee.feeInputs);
       const unsignedTx = builder.buildUnsignedTransaction();
 
       try {
-        if (opts.dryRun) return await withTimeout(this.submitDryRun(provider, unsignedTx), 30_000, "submitting the transaction");
-        const result = await withTimeout(this.submitReal(provider, unsignedTx), 60_000, "submitting the transaction");
+        const extraSigners = privateFee ? [privateFee.feeSigner] : [];
+        if (opts.dryRun) return await withTimeout(this.submitDryRun(provider, unsignedTx, extraSigners), 30_000, "submitting the transaction");
+        const result = await withTimeout(this.submitReal(provider, unsignedTx, extraSigners), 60_000, "submitting the transaction");
         await recordKnownVersions(result);
+        if (privateFee && feeType.kind === "private") {
+          await this.recordPrivateFeeSpend(accountId, feeType.feeResourceAddress, privateFee, String(result.transaction_id));
+        }
         return withTransactionId(result);
       } catch (e) {
         if (!(e instanceof Error) || attempt >= maxRetries) throw e;
@@ -593,10 +639,11 @@ export class OotleAccount implements WalletAccountApi {
    */
   private async submitDryRun(
     provider: IndexerProvider,
-    unsignedTx: UnsignedTransactionWithBlobs
+    unsignedTx: UnsignedTransactionWithBlobs,
+    extraSigners: Signer[] = []
   ): Promise<{ transaction_id: TransactionId; result: ExecuteResult }> {
     const resolved = await resolveTransaction(provider, { ...unsignedTx, dry_run: true });
-    const signed = await signTransaction([this.signer], resolved);
+    const signed = await signTransaction([this.signer, ...extraSigners], resolved);
     const envelope = sealTransaction(signed);
     const res = await fetch(`${defaultIndexerUrl(this.network)}/transactions/dry-run`, {
       method: "POST",
@@ -650,7 +697,11 @@ export class OotleAccount implements WalletAccountApi {
    * proven correct; only the result-polling and error-message construction are reimplemented, in
    * the same detailed shape `submitDryRun()` above already produces.
    */
-  private async submitReal(provider: IndexerProvider, unsignedTx: UnsignedTransactionWithBlobs): Promise<IndexerGetTransactionResultResponse> {
+  private async submitReal(
+    provider: IndexerProvider,
+    unsignedTx: UnsignedTransactionWithBlobs,
+    extraSigners: Signer[] = []
+  ): Promise<IndexerGetTransactionResultResponse & { transaction_id: TransactionId }> {
     const resolved = await resolveTransaction(provider, unsignedTx);
     // Both of these parse the transaction inside the wasm as an untagged enum
     // (`ootle_wasm/core/src/transaction.rs`), so a single bad field anywhere collapses into "data
@@ -661,7 +712,7 @@ export class OotleAccount implements WalletAccountApi {
     // is attached here rather than guessed at afterwards.
     let signed;
     try {
-      signed = await signTransaction([this.signer], resolved);
+      signed = await signTransaction([this.signer, ...extraSigners], resolved);
     } catch (e) {
       throw new Error(
         `${e instanceof Error ? e.message : String(e)} — at signTransaction; resolved tx: ${describeResolvedTx(resolved)}`,
@@ -678,7 +729,8 @@ export class OotleAccount implements WalletAccountApi {
       );
     }
     const { transaction_id } = await provider.submitTransaction(envelope);
-    return pollTransactionResult(provider, transaction_id);
+    const result = await pollTransactionResult(provider, transaction_id);
+    return { ...result, transaction_id };
   }
 
   /**
@@ -705,7 +757,7 @@ export class OotleAccount implements WalletAccountApi {
    * never reveals the owner key `CreateAccount` needs, so that form can only pay an account that
    * already exists.
    */
-  async send(recipientAddress: string, resourceAddress: string, amount: bigint, maxFee = 5000n) {
+  async send(recipientAddress: string, resourceAddress: string, amount: bigint, maxFee = 5000n, feeType: FeeType = { kind: "transparent" }) {
     const account = await this.getComponentAddress();
     const isWalletAddress = recipientAddress.startsWith("otl");
     const recipient = isWalletAddress ? componentAddressFromWalletAddress(recipientAddress) : recipientAddress;
@@ -736,7 +788,7 @@ export class OotleAccount implements WalletAccountApi {
       { PutLastInstructionOutputOnWorkspace: { key: 0 } },
       { CallMethod: { call: { Address: recipient }, method: "deposit", args: [{ Workspace: { id: 0, offset: null } }] } },
     );
-    return this.execute(instructions, { maxFee });
+    return this.execute(instructions, { maxFee, feeType });
   }
 
   /**
@@ -769,7 +821,7 @@ export class OotleAccount implements WalletAccountApi {
    * produces a bucket holding the one new confidential output, which `deposit` puts back in the
    * same vault.
    */
-  async depositConfidential(resourceAddress: string, amount: bigint, maxFee = 50000n) {
+  async depositConfidential(resourceAddress: string, amount: bigint, maxFee = 50000n, feeType: FeeType = { kind: "transparent" }) {
     if (amount <= 0n) throw new Error(`depositConfidential: amount must be greater than zero, got ${amount}`);
     const account = await this.getComponentAddress();
     const ownerPublicKey = await this.getPublicKey();
@@ -811,7 +863,7 @@ export class OotleAccount implements WalletAccountApi {
       { PutLastInstructionOutputOnWorkspace: { key: 0 } },
       { CallMethod: { call: { Address: account }, method: "deposit", args: [{ Workspace: { id: 0, offset: null } }] } },
     ];
-    return this.execute(instructions, { maxFee });
+    return this.execute(instructions, { maxFee, feeType });
   }
 
   /**
@@ -947,6 +999,7 @@ export class OotleAccount implements WalletAccountApi {
     maxFee = 50000n,
     memo?: string,
     minimumValuePromise = 0n,
+    feeType: FeeType = { kind: "transparent" },
   ): Promise<{ transactionId: string; commitment: string; substateId: string; minimumValuePromise: string }> {
     assertValidMinimumValuePromise(minimumValuePromise, amount);
     const accountId = localAccountId(this.index);
@@ -957,7 +1010,7 @@ export class OotleAccount implements WalletAccountApi {
     // live). See getWalletAddress()'s doc comment for why these two addresses are easy to conflate.
     const walletAddress = await this.getWalletAddress();
 
-    const spec = await new StealthTransfer(provider, resourceAddress)
+    const builder = new StealthTransfer(provider, resourceAddress)
       // StealthTransfer.prepare() auto-adds the revealed account's own substate and any vault
       // addresses embedded in its on-chain state, but never the resource's own substate -- fine
       // for XTR (resource_0101...0101 is engine-special-cased and needs no lock), but any other
@@ -966,28 +1019,26 @@ export class OotleAccount implements WalletAccountApi {
       // source (node_modules/@tari-project/ootle/dist/index.js) -- not assumed from the docs.
       .withBuilder((b) => b.addInput({ substate_id: resourceAddress, version: null }))
       .spendRevealedInput(account, amount)
-      .toStealthOutput(createOutput({ destination: walletAddress, amount, resourceAddress, memo: toMemo(memo), minimumValuePromise }))
-      .payFeeFromRevealed(maxFee)
-      .prepare();
+      .toStealthOutput(createOutput({ destination: walletAddress, amount, resourceAddress, memo: toMemo(memo), minimumValuePromise }));
+    // No stealth inputs to unblind for a shield's own transfer (revealed-only source), so no
+    // viewSecret needed here even when the FEE is paid privately -- `prepareSignSubmit` handles
+    // that UTXO's own decryption internally. `fromSpec`'s own default crypto is
+    // `new WasmStealthCrypto()` -- Network.LocalNet, NOT this account's real network -- which
+    // produced an "Invalid transaction signature" server-side rejection (confirmed live) since
+    // the balance proof it computes is network-domain-separated. Must match the network
+    // StealthTransfer itself used when it built the outputs statement (`prepareSignSubmit`
+    // already passes `this.network` for exactly this reason).
+    const { transactionId, spec, privateFee } = await this.prepareSignSubmit(builder, provider, account, maxFee, feeType);
     const ownCommitment = extractOutputCommitment(spec, 0);
-
-    const wallet = new OotleWallet().registerKeyProvider(account, this.signer).setDefaultSigner(account);
-    // No stealth inputs to unblind for a shield (revealed-only source), so no viewSecret needed.
-    // `fromSpec`'s own default crypto is `new WasmStealthCrypto()` -- Network.LocalNet, NOT this
-    // account's real network -- which produced an "Invalid transaction signature" server-side
-    // rejection (confirmed live) since the balance proof it computes is network-domain-separated.
-    // Must match the network StealthTransfer itself used when it built the outputs statement.
-    const authorized = await WalletStealthAuthorizer.fromSpec(wallet, spec, { crypto: new WasmStealthCrypto(this.network) }).prepare(
-      provider
-    );
-    const envelope = await authorized.seal();
-    const transactionId = await submitTransaction(provider, envelope);
 
     await addPendingShield({ transactionId, accountId, resourceAddress, amount: amount.toString(), ownCommitment, memo });
     try {
       const response = await withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the shield transaction");
       await recordKnownVersions(response);
       await recordKnownShieldedOutput(accountId, resourceAddress, ownCommitment, amount, transactionId, memo);
+      if (privateFee && feeType.kind === "private") {
+        await this.recordPrivateFeeSpend(accountId, feeType.feeResourceAddress, privateFee, transactionId);
+      }
     } finally {
       await removePendingShield(transactionId);
     }
@@ -1095,7 +1146,13 @@ export class OotleAccount implements WalletAccountApi {
    * mark the spent ones, even if the service worker dies between finalization and the storage
    * writes.
    */
-  async unshield(resourceAddress: string, revealedOutAmount: bigint, maxFee = 100000n, memo?: string): Promise<{ transactionId: string }> {
+  async unshield(
+    resourceAddress: string,
+    revealedOutAmount: bigint,
+    maxFee = 100000n,
+    memo?: string,
+    feeType: FeeType = { kind: "transparent" },
+  ): Promise<{ transactionId: string }> {
     const accountId = localAccountId(this.index);
     const records = await listShieldedOutputs(accountId);
     const { commitments, remainder } = resolveUnshieldPlan(records, resourceAddress, revealedOutAmount);
@@ -1115,21 +1172,25 @@ export class OotleAccount implements WalletAccountApi {
     for (const commitment of commitments) {
       builder = builder.spendStealthInput(account, fromHex(commitment));
     }
-    const spec = await builder
+    builder = builder
       .toStealthOutput(createOutput({ destination: walletAddress, amount: remainder, resourceAddress, memo: toMemo(memo) }))
-      .toRevealedOutput(revealedOutAmount + dust)
-      .payFeeFromRevealed(maxFee)
-      .prepare();
-    const ownCommitment = extractOutputCommitment(spec, 0);
+      .toRevealedOutput(revealedOutAmount + dust);
 
-    const wallet = new OotleWallet().registerKeyProvider(account, this.signer).setDefaultSigner(account);
     const viewSecret = await this.signer.getViewSecret();
-    // See shield()'s comment: must pass this account's real network, not fromSpec's LocalNet default.
-    const authorized = await WalletStealthAuthorizer.fromSpec(wallet, spec, { viewSecret, crypto: new WasmStealthCrypto(this.network) }).prepare(
-      provider
+    // See shield()'s comment: must pass this account's real network, not fromSpec's LocalNet
+    // default. `commitments` is excluded from the fee UTXO's own selection so the same shielded
+    // record can never be spent twice in one transaction (as both a main input here and the fee
+    // input) when `resourceAddress` and the fee's resource happen to be the same currency.
+    const { transactionId, spec, privateFee } = await this.prepareSignSubmit(
+      builder,
+      provider,
+      account,
+      maxFee,
+      feeType,
+      { viewSecret },
+      commitments
     );
-    const envelope = await authorized.seal();
-    const transactionId = await submitTransaction(provider, envelope);
+    const ownCommitment = extractOutputCommitment(spec, 0);
 
     await addPendingShield({
       transactionId,
@@ -1146,6 +1207,9 @@ export class OotleAccount implements WalletAccountApi {
       await recordKnownShieldedOutput(accountId, resourceAddress, ownCommitment, remainder, transactionId, memo);
       for (const commitment of commitments) {
         await markShieldedOutputSpent(accountId, commitment);
+      }
+      if (privateFee && feeType.kind === "private") {
+        await this.recordPrivateFeeSpend(accountId, feeType.feeResourceAddress, privateFee, transactionId);
       }
     } finally {
       await removePendingShield(transactionId);
@@ -1186,7 +1250,8 @@ export class OotleAccount implements WalletAccountApi {
     workspaceVarName: string,
     followUpInstructions: Instruction[],
     relatedComponents: string[] = [],
-    maxFee = 100000n
+    maxFee = 100000n,
+    feeType: FeeType = { kind: "transparent" }
   ): Promise<{ transactionId: string }> {
     if (amount <= 0n) throw new Error(`withdrawStealthAndExecute amount must be > 0, got ${amount}`);
     const provider = await this.getProvider();
@@ -1215,17 +1280,13 @@ export class OotleAccount implements WalletAccountApi {
         builder = builder.withBuilder((b) => b.addInput({ substate_id: vaultId, version: null }));
       }
     }
-    const spec = await builder.payFeeFromRevealed(maxFee).prepare();
-
-    const wallet = new OotleWallet().registerKeyProvider(account, this.signer).setDefaultSigner(account);
     const viewSecret = await this.signer.getViewSecret();
-    const authorized = await WalletStealthAuthorizer.fromSpec(wallet, spec, { viewSecret, crypto: new WasmStealthCrypto(this.network) }).prepare(
-      provider
-    );
-    const envelope = await authorized.seal();
-    const transactionId = await submitTransaction(provider, envelope);
+    const { transactionId, privateFee } = await this.prepareSignSubmit(builder, provider, account, maxFee, feeType, { viewSecret });
     const response = await withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the transaction");
     await recordKnownVersions(response);
+    if (privateFee && feeType.kind === "private") {
+      await this.recordPrivateFeeSpend(localAccountId(this.index), feeType.feeResourceAddress, privateFee, transactionId);
+    }
     return { transactionId };
   }
 
@@ -1263,7 +1324,8 @@ export class OotleAccount implements WalletAccountApi {
     revealedAmount: bigint,
     followUpInstructions: Instruction[],
     relatedComponents: string[] = [],
-    maxFee = 100000n
+    maxFee = 100000n,
+    feeType: FeeType = { kind: "transparent" }
   ): Promise<{ transactionId: string }> {
     if (revealedAmount <= 0n) {
       throw new Error(`redeemStealthOutputAndExecute: revealedAmount must be > 0, got ${revealedAmount}`);
@@ -1294,6 +1356,7 @@ export class OotleAccount implements WalletAccountApi {
       new StealthOutputsStatement(outputsJson)
     );
 
+    const privateFee = await this.resolvePrivateFee(feeType, maxFee);
     const maxEpoch = await resolveMaxEpoch(provider);
     const builder = TransactionBuilder.new(this.network, maxEpoch)
       .addInstruction({
@@ -1308,11 +1371,19 @@ export class OotleAccount implements WalletAccountApi {
       // (name resolution only applies to instructions built through *this* same chain; raw
       // pre-built instructions bypass it, same constraint `withdrawStealthAndExecute` documents).
       .saveVar("redeemed")
-      .withInstructions(followUpInstructions)
-      .feeTransactionPayFromComponent(account, maxFee)
+      .withInstructions(followUpInstructions);
+    if (privateFee) {
+      for (const instr of privateFee.feeInstructions) builder.addFeeInstruction(instr);
+    } else {
+      builder.feeTransactionPayFromComponent(account, maxFee);
+    }
+    builder
       .addInput({ substate_id: resourceAddress, version: null })
       .addInput({ substate_id: stealthUtxoSubstateId(resourceAddress, commitment), version: null })
       .addInput({ substate_id: account, version: null });
+    if (privateFee) {
+      for (const input of privateFee.feeInputs) builder.addInput(input);
+    }
     for (const vaultId of await getVaultIdsForAccount(provider, account)) {
       builder.addInput({ substate_id: vaultId, version: null });
     }
@@ -1344,10 +1415,13 @@ export class OotleAccount implements WalletAccountApi {
     const authorized = await WalletStealthAuthorizer.fromSpec(wallet, spec, { viewSecret, crypto: new WasmStealthCrypto(this.network) }).prepare(
       provider
     );
-    const envelope = await authorized.seal();
+    const envelope = privateFee ? await this.sealWithPrivateFee(authorized, privateFee.feeSigner) : await authorized.seal();
     const transactionId = await submitTransaction(provider, envelope);
     const response = await withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the redemption transaction");
     await recordKnownVersions(response);
+    if (privateFee && feeType.kind === "private") {
+      await this.recordPrivateFeeSpend(localAccountId(this.index), feeType.feeResourceAddress, privateFee, transactionId);
+    }
     return { transactionId };
   }
 
@@ -1394,6 +1468,202 @@ export class OotleAccount implements WalletAccountApi {
    *   (which records its own outputs locally) — callers doing several of these in sequence must
    *   thread this value into the next call's `feeCommitmentHex` themselves.
    */
+  /**
+   * Builds the fee-payment instructions/inputs for spending a single stealth UTXO of
+   * `feeResourceAddress` to cover `maxFee`, plus the one-time `Signer` that must co-sign the
+   * resulting `StealthTransfer` fee spend (an ordinary account signature can't authorize a
+   * stealth spend -- see `redeemStealthOutputWithPrivateFee`'s doc comment, which this method's
+   * fee-half logic was extracted from verbatim). The unspent remainder above `maxFee` becomes a
+   * new stealth output back to this account (`feeChangeCommitment`); this only builds
+   * instructions, it doesn't touch local storage -- the caller records the change output (e.g.
+   * via `recordKnownShieldedOutput`) and marks `feeCommitmentHex` spent once the transaction
+   * actually lands, exactly as `redeemStealthOutputWithPrivateFee` itself does inline.
+   *
+   * Deliberately single-UTXO only, like the method this was extracted from -- the only shape
+   * confirmed live. Aggregating several stealth inputs into one `StealthTransfer` fee spend
+   * isn't proven here: `unshield()`'s multi-commitment coin selection uses a different,
+   * higher-level signing pipeline (`WalletStealthAuthorizer`) that isn't available inside this
+   * raw `TransactionBuilder`/`resolveTransaction`/`signTransaction` pipeline. Callers needing
+   * more than one stealth input's worth of fee should pick the smallest single covering UTXO,
+   * not sum several.
+   */
+  private async buildPrivateFeeInstructions(
+    feeResourceAddress: string,
+    feeCommitmentHex: string,
+    maxFee: bigint
+  ): Promise<{
+    feeInstructions: Instruction[];
+    feeInputs: SubstateRequirement[];
+    feeChangeCommitment: string;
+    feeChangeAmount: bigint;
+    feeSigner: Signer;
+  }> {
+    if (maxFee <= 0n) throw new Error(`buildPrivateFeeInstructions: maxFee must be > 0, got ${maxFee}`);
+    const provider = await this.getProvider();
+    const crypto = new WasmStealthCrypto(this.network);
+    const walletAddress = await this.getWalletAddress();
+    const viewSecret = await this.signer.getViewSecret();
+
+    const commitment = fromHex(feeCommitmentHex);
+    const substateId = stealthUtxoSubstateId(feeResourceAddress, commitment);
+    const substate = await provider.getSubstate(substateId);
+    const decrypted = await decryptOwnedUtxo(crypto, viewSecret, substate, substateId);
+    if (!decrypted) {
+      throw new Error(`buildPrivateFeeInstructions: cannot decrypt ${substateId} -- it doesn't belong to this account, or is already spent.`);
+    }
+    if (decrypted.value <= maxFee) {
+      throw new Error(`buildPrivateFeeInstructions: fee UTXO (${decrypted.value}) is too small to cover maxFee (${maxFee})`);
+    }
+    const feeChange = decrypted.value - maxFee;
+
+    const inputSkeleton = JSON.stringify({ inputs: [{ commitment: feeCommitmentHex, witness: "KeyPath" }], revealed_amount: "0" });
+    const feeChangeOutput = createOutput({ destination: walletAddress, amount: feeChange, resourceAddress: feeResourceAddress });
+    const { statement: feeOutputsStatement, outputMask: feeOutputMask } = await crypto.generateOutputsStatement([feeChangeOutput], maxFee);
+    const feeInputsStatement = new StealthInputsStatement([], 0n, inputSkeleton);
+    const feeAggInputMask = await crypto.aggregateInputMasks([decrypted.mask]);
+    const feeBalanceProof = await crypto.generateBalanceProofSignature(
+      feeAggInputMask,
+      feeOutputMask,
+      feeInputsStatement.statementJson!,
+      feeOutputsStatement.statementJson
+    );
+    const feeStatement = new StealthTransferStatement(feeInputsStatement, feeOutputsStatement, feeBalanceProof);
+    await crypto.validateTransfer(feeStatement);
+    const feeChangeCommitment = (feeOutputsStatement.parsed() as { outputs: { output: { commitment: string } }[] }).outputs[0]!.output.commitment;
+
+    const feeInstructions: Instruction[] = [
+      {
+        StealthTransfer: {
+          resource_address_ref: { Address: feeResourceAddress },
+          statement: { __ootleRawJson: feeStatement.toCompactJson() },
+          revealed_input_bucket: null,
+        },
+      } as unknown as Instruction,
+      { PutLastInstructionOutputOnWorkspace: { key: 0 } } as unknown as Instruction,
+      { PayFeeFromBucket: { bucket: { id: 0, offset: null } } } as unknown as Instruction,
+    ];
+    const feeInputs: SubstateRequirement[] = [
+      { substate_id: feeResourceAddress, version: null },
+      { substate_id: substateId, version: null },
+    ];
+
+    // The fee input's own sender_public_nonce lives on its UTXO substate -- fetched again here
+    // (decryptOwnedUtxo above didn't return it) rather than parsed out of the substate response
+    // type, whose shape `decryptOwnedUtxo` already validated once. Same convention
+    // `redeemStealthOutputWithPrivateFee` used before this was extracted.
+    const feeSubstate = await provider.getSubstate(substateId);
+    const feeNonce = (feeSubstate as unknown as { substate: { Utxo: { output: { output: { public_nonce: string } } } } }).substate.Utxo.output
+      .output.public_nonce;
+    const feeSigner: Signer = {
+      getAddress: async () => walletAddress,
+      getPublicKey: async () => parseOotleAddress(walletAddress).owner_key,
+      signTransaction: async (tx: UnsignedTransactionWithBlobs, sealPublicKey: Uint8Array) => {
+        const json = serializeUnsignedTx(tx);
+        const sig = await this.signer.addStealthSignature!(json, fromHex(feeNonce), sealPublicKey, { crypto });
+        return [sig];
+      },
+    };
+
+    return { feeInstructions, feeInputs, feeChangeCommitment, feeChangeAmount: feeChange, feeSigner };
+  }
+
+  /**
+   * Wires a `buildPrivateFeeInstructions()` result into a `StealthTransfer` builder in place of
+   * `.payFeeFromRevealed(maxFee)` -- via the builder's `withBuilder` escape hatch, since the
+   * class has no first-class "pay fee from a stealth UTXO" method of its own.
+   */
+  private attachPrivateFee(
+    builder: StealthTransfer,
+    fee: PrivateFeeMaterial
+  ): StealthTransfer {
+    return builder.withBuilder((b) => {
+      for (const instr of fee.feeInstructions) b.addFeeInstruction(instr);
+      for (const input of fee.feeInputs) b.addInput(input);
+      return b;
+    });
+  }
+
+  /**
+   * Completes signing for a `StealthTransfer`-based operation whose fee was attached via
+   * `attachPrivateFee`: adds the fee UTXO's one-time authorization as an extra signature
+   * (`AuthorizedTransfer.addSignature`) alongside whatever `WalletStealthAuthorizer` already
+   * produced for the operation's own stealth inputs, then seals. Bound to the same seal public
+   * key `authorized` itself uses, so every signature verifies against the same tx hash (see
+   * `AuthorizedTransfer.seal`'s doc comment).
+   */
+  private async sealWithPrivateFee(authorized: AuthorizedTransfer, feeSigner: Signer) {
+    const sealPublicKey = authorized.getSealPublicKey();
+    const signatures = await feeSigner.signTransaction(authorized.getSpec().unsignedTx, sealPublicKey);
+    for (const signature of signatures) authorized.addSignature(signature);
+    return authorized.seal();
+  }
+
+  /**
+   * Shared bookkeeping after ANY operation (`execute()` included) whose fee was paid privately
+   * lands on-chain: records the fee UTXO's change output and marks the spent one, mirroring
+   * `shield()`/`unshield()`'s existing pattern for their own outputs. Never call this for a dry
+   * run or a failed submission.
+   */
+  private async recordPrivateFeeSpend(accountId: string, feeResourceAddress: string, fee: PrivateFeeMaterial, transactionId: string) {
+    await recordKnownShieldedOutput(accountId, feeResourceAddress, fee.feeChangeCommitment, fee.feeChangeAmount, transactionId);
+    await markShieldedOutputSpent(accountId, fee.spentCommitment);
+  }
+
+  /**
+   * Selects and builds everything needed to pay a transaction's fee privately, or returns `null`
+   * for `{ kind: "transparent" }` -- the single entry point every fee-paying method (`execute()`
+   * and every `StealthTransfer`-based one below) uses to interpret a `FeeType` the same way.
+   */
+  private async resolvePrivateFee(
+    feeType: FeeType,
+    maxFee: bigint,
+    /** Commitments already claimed by the operation's own main effect (e.g. `unshield()`'s or
+     * `sendPrivately()`'s own multi-UTXO coin selection) -- excluded so the same commitment can
+     * never be selected as both a main input and the fee input in one transaction. */
+    exclude: string[] = []
+  ): Promise<PrivateFeeMaterial | null> {
+    if (feeType.kind !== "private") return null;
+    const accountId = localAccountId(this.index);
+    const chosen = selectPrivateFeeUtxo(await listShieldedOutputs(accountId), feeType.feeResourceAddress, maxFee, exclude);
+    const built = await this.buildPrivateFeeInstructions(feeType.feeResourceAddress, chosen.commitment, maxFee);
+    return { ...built, spentCommitment: chosen.commitment };
+  }
+
+  /**
+   * Shared prepare/authorize/seal/submit path for every `StealthTransfer`-based operation
+   * (shield/unshield/withdrawStealthAndExecute/etc.): `builder` must already have every
+   * operation-specific call applied (`spendRevealedInput`, `toStealthOutput`,
+   * `spendStealthInput`, `andThen`, ...) EXCEPT the fee -- this attaches either
+   * `.payFeeFromRevealed(maxFee)` or a private fee (via `resolvePrivateFee`/`attachPrivateFee`),
+   * then authorizes with `WalletStealthAuthorizer` (passing `authorizerOpts` through, e.g.
+   * `viewSecret` when the operation itself spends stealth inputs), seals (co-signing the private
+   * fee's UTXO when there is one), and submits -- but does NOT poll to finality or record
+   * anything: callers keep their own existing `addPendingShield`/poll/`recordKnownShieldedOutput`
+   * logic for the operation's own effect, and must call `recordPrivateFeeSpend` themselves once
+   * `transactionId` actually lands (never for a dry run) using the returned `privateFee`.
+   */
+  private async prepareSignSubmit(
+    builder: StealthTransfer,
+    provider: IndexerProvider,
+    account: string,
+    maxFee: bigint,
+    feeType: FeeType,
+    authorizerOpts: { viewSecret?: Uint8Array } = {},
+    /** See `resolvePrivateFee`'s own doc comment. */
+    excludeFromFeeSelection: string[] = []
+  ): Promise<{ transactionId: string; spec: StealthTransferSpec; privateFee: PrivateFeeMaterial | null }> {
+    const privateFee = await this.resolvePrivateFee(feeType, maxFee, excludeFromFeeSelection);
+    const spec = await (privateFee ? this.attachPrivateFee(builder, privateFee) : builder.payFeeFromRevealed(maxFee)).prepare();
+    const wallet = new OotleWallet().registerKeyProvider(account, this.signer).setDefaultSigner(account);
+    const authorized = await WalletStealthAuthorizer.fromSpec(wallet, spec, {
+      crypto: new WasmStealthCrypto(this.network),
+      ...authorizerOpts,
+    }).prepare(provider);
+    const envelope = privateFee ? await this.sealWithPrivateFee(authorized, privateFee.feeSigner) : await authorized.seal();
+    const transactionId = await submitTransaction(provider, envelope);
+    return { transactionId, spec, privateFee };
+  }
+
   async redeemStealthOutputWithPrivateFee(
     resourceAddress: string,
     commitmentHex: string,
@@ -1405,35 +1675,31 @@ export class OotleAccount implements WalletAccountApi {
     relatedComponents: string[] = []
   ): Promise<{ transactionId: string; feeChangeCommitment: string }> {
     if (revealedAmount <= 0n) throw new Error(`redeemStealthOutputWithPrivateFee: revealedAmount must be > 0, got ${revealedAmount}`);
-    if (maxFee <= 0n) throw new Error(`redeemStealthOutputWithPrivateFee: maxFee must be > 0, got ${maxFee}`);
     const provider = await this.getProvider();
     const crypto = new WasmStealthCrypto(this.network);
     const walletAddress = await this.getWalletAddress();
     const viewSecret = await this.signer.getViewSecret();
 
-    const decryptStealthInput = async (resource: string, commitmentHexIn: string) => {
-      const commitment = fromHex(commitmentHexIn);
-      const substateId = stealthUtxoSubstateId(resource, commitment);
-      const substate = await provider.getSubstate(substateId);
-      const decrypted = await decryptOwnedUtxo(crypto, viewSecret, substate, substateId);
-      if (!decrypted) {
-        throw new Error(`redeemStealthOutputWithPrivateFee: cannot decrypt ${substateId} -- it doesn't belong to this account, or is already spent.`);
-      }
-      return { commitmentHex: commitmentHexIn, substateId, mask: decrypted.mask, value: decrypted.value };
-    };
-
-    const redeemed = await decryptStealthInput(resourceAddress, commitmentHex);
-    const feeInput = await decryptStealthInput(feeResourceAddress, feeCommitmentHex);
-    if (feeInput.value <= maxFee) {
-      throw new Error(`redeemStealthOutputWithPrivateFee: fee UTXO (${feeInput.value}) is too small to cover maxFee (${maxFee})`);
+    const commitment = fromHex(commitmentHex);
+    const substateId = stealthUtxoSubstateId(resourceAddress, commitment);
+    const substate = await provider.getSubstate(substateId);
+    const decrypted = await decryptOwnedUtxo(crypto, viewSecret, substate, substateId);
+    if (!decrypted) {
+      throw new Error(`redeemStealthOutputWithPrivateFee: cannot decrypt ${substateId} -- it doesn't belong to this account, or is already spent.`);
     }
-    const feeChange = feeInput.value - maxFee;
+    const redeemed = { commitmentHex, substateId, mask: decrypted.mask, value: decrypted.value };
 
-    const inputSkeleton = (hex: string) => JSON.stringify({ inputs: [{ commitment: hex, witness: "KeyPath" }], revealed_amount: "0" });
+    const { feeInstructions, feeInputs, feeChangeCommitment, feeSigner } = await this.buildPrivateFeeInstructions(
+      feeResourceAddress,
+      feeCommitmentHex,
+      maxFee
+    );
+
+    const inputSkeleton = JSON.stringify({ inputs: [{ commitment: redeemed.commitmentHex, witness: "KeyPath" }], revealed_amount: "0" });
 
     // Redeemed resource: 1 stealth input -> 0 stealth outputs, fully revealed into the bucket
     // `followUpInstructions` consumes.
-    const redeemedInputsStatement = new StealthInputsStatement([], 0n, inputSkeleton(redeemed.commitmentHex));
+    const redeemedInputsStatement = new StealthInputsStatement([], 0n, inputSkeleton);
     const redeemedOutputsStatement = new StealthOutputsStatement(
       JSON.stringify({ outputs: [], revealed_output_amount: revealedAmount.toString(), agg_range_proof: "" })
     );
@@ -1447,21 +1713,6 @@ export class OotleAccount implements WalletAccountApi {
     const redeemedStatement = new StealthTransferStatement(redeemedInputsStatement, redeemedOutputsStatement, redeemedBalanceProof);
     await crypto.validateTransfer(redeemedStatement);
 
-    // Fee resource: 1 stealth input -> 1 stealth change output + revealed maxFee.
-    const feeChangeOutput = createOutput({ destination: walletAddress, amount: feeChange, resourceAddress: feeResourceAddress });
-    const { statement: feeOutputsStatement, outputMask: feeOutputMask } = await crypto.generateOutputsStatement([feeChangeOutput], maxFee);
-    const feeInputsStatement = new StealthInputsStatement([], 0n, inputSkeleton(feeInput.commitmentHex));
-    const feeAggInputMask = await crypto.aggregateInputMasks([feeInput.mask]);
-    const feeBalanceProof = await crypto.generateBalanceProofSignature(
-      feeAggInputMask,
-      feeOutputMask,
-      feeInputsStatement.statementJson!,
-      feeOutputsStatement.statementJson
-    );
-    const feeStatement = new StealthTransferStatement(feeInputsStatement, feeOutputsStatement, feeBalanceProof);
-    await crypto.validateTransfer(feeStatement);
-    const feeChangeCommitment = (feeOutputsStatement.parsed() as { outputs: { output: { commitment: string } }[] }).outputs[0]!.output.commitment;
-
     const maxEpoch = await resolveMaxEpoch(provider);
     const builder = TransactionBuilder.new(this.network, maxEpoch)
       .addInstruction({
@@ -1472,20 +1723,10 @@ export class OotleAccount implements WalletAccountApi {
         },
       } as unknown as Instruction)
       .addInstruction({ PutLastInstructionOutputOnWorkspace: { key: 0 } } as unknown as Instruction)
-      .withInstructions(followUpInstructions)
-      .addFeeInstruction({
-        StealthTransfer: {
-          resource_address_ref: { Address: feeResourceAddress },
-          statement: { __ootleRawJson: feeStatement.toCompactJson() },
-          revealed_input_bucket: null,
-        },
-      } as unknown as Instruction)
-      .addFeeInstruction({ PutLastInstructionOutputOnWorkspace: { key: 0 } } as unknown as Instruction)
-      .addFeeInstruction({ PayFeeFromBucket: { bucket: { id: 0, offset: null } } } as unknown as Instruction)
-      .addInput({ substate_id: resourceAddress, version: null })
-      .addInput({ substate_id: redeemed.substateId, version: null })
-      .addInput({ substate_id: feeResourceAddress, version: null })
-      .addInput({ substate_id: feeInput.substateId, version: null });
+      .withInstructions(followUpInstructions);
+    for (const instr of feeInstructions) builder.addFeeInstruction(instr);
+    builder.addInput({ substate_id: resourceAddress, version: null }).addInput({ substate_id: redeemed.substateId, version: null });
+    for (const input of feeInputs) builder.addInput(input);
     for (const component of relatedComponents) {
       builder.addInput({ substate_id: component, version: null });
       for (const vaultId of await getVaultIdsForAccount(provider, component)) {
@@ -1494,29 +1735,23 @@ export class OotleAccount implements WalletAccountApi {
     }
     const unsignedTx = await resolveTransaction(provider, builder.buildUnsignedTransaction());
 
-    // One addStealthSignature per stealth input, bound to a shared (arbitrary) seal key that
-    // signTransaction generates -- see this method's own doc comment for why no ordinary
+    // The redeemed input's one-time key co-signs the same way the fee input's does inside
+    // `buildPrivateFeeInstructions` -- see this method's own doc comment for why no ordinary
     // account-key signature is added.
-    const oneTimeSigner = (publicNonceHex: string) => ({
+    const redeemedSubstate = await provider.getSubstate(redeemed.substateId);
+    const redeemedNonce = (redeemedSubstate as unknown as { substate: { Utxo: { output: { output: { public_nonce: string } } } } }).substate.Utxo
+      .output.output.public_nonce;
+    const redeemedSigner: Signer = {
       getAddress: async () => walletAddress,
       getPublicKey: async () => parseOotleAddress(walletAddress).owner_key,
       signTransaction: async (tx: UnsignedTransactionWithBlobs, sealPublicKey: Uint8Array) => {
         const json = serializeUnsignedTx(tx);
-        const sig = await this.signer.addStealthSignature!(json, fromHex(publicNonceHex), sealPublicKey, { crypto });
+        const sig = await this.signer.addStealthSignature!(json, fromHex(redeemedNonce), sealPublicKey, { crypto });
         return [sig];
       },
-    });
-    // Each stealth input's own sender_public_nonce lives on its UTXO substate -- fetched again
-    // here (decryptOwnedUtxo above didn't return it) rather than parsed out of the substate
-    // response type, whose shape `decryptOwnedUtxo` already validated once.
-    const redeemedSubstate = await provider.getSubstate(redeemed.substateId);
-    const feeInputSubstate = await provider.getSubstate(feeInput.substateId);
-    const redeemedNonce = (redeemedSubstate as unknown as { substate: { Utxo: { output: { output: { public_nonce: string } } } } }).substate.Utxo
-      .output.output.public_nonce;
-    const feeNonce = (feeInputSubstate as unknown as { substate: { Utxo: { output: { output: { public_nonce: string } } } } }).substate.Utxo.output
-      .output.public_nonce;
+    };
 
-    const signed = await signTransaction([oneTimeSigner(redeemedNonce), oneTimeSigner(feeNonce)], unsignedTx);
+    const signed = await signTransaction([redeemedSigner, feeSigner], unsignedTx);
     const envelope = sealTransaction(signed);
     const transactionId = await submitTransaction(provider, envelope);
     const response = await withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the private-fee redemption transaction");
@@ -1560,7 +1795,8 @@ export class OotleAccount implements WalletAccountApi {
     claimantWalletAddress: string,
     hashLockHex: string,
     refundEpoch: bigint,
-    maxFee = 50000n
+    maxFee = 50000n,
+    feeType: FeeType = { kind: "transparent" }
   ): Promise<{ transactionId: string; conditions: object[]; ownCommitment: string; outputMask: string }> {
     const provider = await this.getProvider();
     const account = await this.getComponentAddress();
@@ -1577,24 +1813,17 @@ export class OotleAccount implements WalletAccountApi {
 
     // See shield()'s comment: the resource's own substate must be pinned explicitly -- prepare()
     // never adds it on its own.
-    const spec = await new StealthTransfer(provider, resourceAddress)
+    const builder = new StealthTransfer(provider, resourceAddress)
       .withBuilder((b) => b.addInput({ substate_id: resourceAddress, version: null }))
       .spendRevealedInput(account, amount)
       .toStealthOutput(
         createOutput({ destination: claimantWalletAddress, amount, resourceAddress, payTo: { Conditions: conditions } })
-      )
-      .payFeeFromRevealed(maxFee)
-      .prepare();
+      );
+    // No stealth inputs to unblind for this fund's own transfer (revealed-only source), so no
+    // viewSecret needed here even when the FEE is paid privately -- same as shield().
+    const { transactionId, spec, privateFee } = await this.prepareSignSubmit(builder, provider, account, maxFee, feeType);
     const ownCommitment = extractOutputCommitment(spec, 0);
     const outputMask = spec.outputMask.toHex();
-
-    const wallet = new OotleWallet().registerKeyProvider(account, this.signer).setDefaultSigner(account);
-    // No stealth inputs to unblind (revealed-only source), so no viewSecret needed -- same as shield().
-    const authorized = await WalletStealthAuthorizer.fromSpec(wallet, spec, { crypto: new WasmStealthCrypto(this.network) }).prepare(
-      provider
-    );
-    const envelope = await authorized.seal();
-    const transactionId = await submitTransaction(provider, envelope);
 
     const response = await withTimeout(
       pollTransactionResult(provider, transactionId),
@@ -1602,6 +1831,9 @@ export class OotleAccount implements WalletAccountApi {
       "submitting the HTLC funding transaction"
     );
     await recordKnownVersions(response);
+    if (privateFee && feeType.kind === "private") {
+      await this.recordPrivateFeeSpend(localAccountId(this.index), feeType.feeResourceAddress, privateFee, transactionId);
+    }
     return { transactionId, conditions, ownCommitment, outputMask };
   }
 
@@ -1637,7 +1869,8 @@ export class OotleAccount implements WalletAccountApi {
     commitmentHex: string,
     conditions: object[],
     preimageHex: string,
-    maxFee = 50000n
+    maxFee = 50000n,
+    feeType: FeeType = { kind: "transparent" }
   ): Promise<{ transactionId: string }> {
     if (!/^[0-9a-f]{64}$/i.test(preimageHex)) {
       throw new Error(`htlcClaim: preimageHex must be exactly 64 hex characters (32 bytes), got ${JSON.stringify(preimageHex)}`);
@@ -1670,6 +1903,7 @@ export class OotleAccount implements WalletAccountApi {
       resourceAddress,
     });
 
+    const privateFee = await this.resolvePrivateFee(feeType, maxFee);
     const transactionId = await submitHtlcSpend({
       provider,
       signer: this.signer,
@@ -1680,7 +1914,11 @@ export class OotleAccount implements WalletAccountApi {
       statementJson,
       maxFee,
       timeoutLabel: "submitting the HTLC claim transaction",
+      privateFee,
     });
+    if (privateFee && feeType.kind === "private") {
+      await this.recordPrivateFeeSpend(localAccountId(this.index), feeType.feeResourceAddress, privateFee, transactionId);
+    }
     return { transactionId };
   }
 
@@ -1708,7 +1946,8 @@ export class OotleAccount implements WalletAccountApi {
     conditions: object[],
     amount: bigint,
     outputMaskHex: string,
-    maxFee = 50000n
+    maxFee = 50000n,
+    feeType: FeeType = { kind: "transparent" }
   ): Promise<{ transactionId: string }> {
     const provider = await this.getProvider();
     const account = await this.getComponentAddress();
@@ -1729,6 +1968,7 @@ export class OotleAccount implements WalletAccountApi {
       resourceAddress,
     });
 
+    const privateFee = await this.resolvePrivateFee(feeType, maxFee);
     const transactionId = await submitHtlcSpend({
       provider,
       signer: this.signer,
@@ -1739,7 +1979,11 @@ export class OotleAccount implements WalletAccountApi {
       statementJson,
       maxFee,
       timeoutLabel: "submitting the HTLC refund transaction",
+      privateFee,
     });
+    if (privateFee && feeType.kind === "private") {
+      await this.recordPrivateFeeSpend(localAccountId(this.index), feeType.feeResourceAddress, privateFee, transactionId);
+    }
     return { transactionId };
   }
 
@@ -1777,6 +2021,7 @@ export class OotleAccount implements WalletAccountApi {
     maxFee = 100000n,
     memo?: string,
     minimumValuePromise = 0n,
+    feeType: FeeType = { kind: "transparent" },
   ): Promise<{ transactionId: string; recipientCommitment: string; recipientSubstateId: string; minimumValuePromise: string }> {
     assertValidMinimumValuePromise(minimumValuePromise, amount);
     const accountId = localAccountId(this.index);
@@ -1805,21 +2050,27 @@ export class OotleAccount implements WalletAccountApi {
     if (changeAmount > 0n) {
       builder = builder.toStealthOutput(createOutput({ destination: ownWalletAddress, amount: changeAmount, resourceAddress }));
     }
-    const spec = await builder.toRevealedOutput(dust).payFeeFromRevealed(maxFee).prepare();
+    builder = builder.toRevealedOutput(dust);
+
+    const viewSecret = await this.signer.getViewSecret();
+    // `commitments` excluded from the fee UTXO's own selection -- see unshield()'s identical
+    // comment on why (this and unshield are the only two methods with their own multi-UTXO
+    // coin selection of potentially the same resource as the fee).
+    const { transactionId, spec, privateFee } = await this.prepareSignSubmit(
+      builder,
+      provider,
+      account,
+      maxFee,
+      feeType,
+      { viewSecret },
+      commitments
+    );
     // Output 0 is the recipient's; output 1 (only present when there's change) is ours. The
     // recipient has no way to discover their new output on their own (no scan-by-view-key API
     // exists) -- this commitment must be handed back to the caller so it can be shared with them
     // out of band; without it, the payment is invisible to them even though it succeeded on-chain.
     const recipientCommitment = extractOutputCommitment(spec, 0);
     const ownCommitment = changeAmount > 0n ? extractOutputCommitment(spec, 1) : undefined;
-
-    const wallet = new OotleWallet().registerKeyProvider(account, this.signer).setDefaultSigner(account);
-    const viewSecret = await this.signer.getViewSecret();
-    const authorized = await WalletStealthAuthorizer.fromSpec(wallet, spec, { viewSecret, crypto: new WasmStealthCrypto(this.network) }).prepare(
-      provider
-    );
-    const envelope = await authorized.seal();
-    const transactionId = await submitTransaction(provider, envelope);
 
     await addPendingShield({
       transactionId,
@@ -1835,6 +2086,9 @@ export class OotleAccount implements WalletAccountApi {
       if (ownCommitment) await recordKnownShieldedOutput(accountId, resourceAddress, ownCommitment, changeAmount, transactionId);
       for (const commitment of commitments) {
         await markShieldedOutputSpent(accountId, commitment);
+      }
+      if (privateFee && feeType.kind === "private") {
+        await this.recordPrivateFeeSpend(accountId, feeType.feeResourceAddress, privateFee, transactionId);
       }
     } finally {
       await removePendingShield(transactionId);
@@ -2197,12 +2451,14 @@ async function submitHtlcSpend(params: {
   statementJson: string;
   maxFee: bigint;
   timeoutLabel: string;
+  /** Resolved by the caller via `OotleAccount.resolvePrivateFee` (a plain function can't call
+   * that private instance method itself) -- `null` for a transparent fee, unchanged behavior. */
+  privateFee: PrivateFeeMaterial | null;
 }): Promise<string> {
   const maxEpoch = await resolveMaxEpoch(params.provider);
   const builder = TransactionBuilder.new(params.network, maxEpoch)
     .addInput({ substate_id: params.substateId, version: null })
     .addInput({ substate_id: params.account, version: null })
-    .feeTransactionPayFromComponent(params.account, params.maxFee)
     .addInstruction(
       // `statement` is spliced as a raw JSON fragment (see buildHtlcSpendStatement), the same
       // technique `@tari-project/ootle`'s own `statementAsWire` uses internally for the piecemeal
@@ -2215,11 +2471,18 @@ async function submitHtlcSpend(params: {
         },
       } as unknown as Instruction
     );
+  if (params.privateFee) {
+    for (const instr of params.privateFee.feeInstructions) builder.addFeeInstruction(instr);
+    for (const input of params.privateFee.feeInputs) builder.addInput(input);
+  } else {
+    builder.feeTransactionPayFromComponent(params.account, params.maxFee);
+  }
   for (const vaultId of await getVaultIdsForAccount(params.provider, params.account)) {
     builder.addInput({ substate_id: vaultId, version: null });
   }
   const unsignedTx = await resolveTransaction(params.provider, builder.buildUnsignedTransaction());
-  const signed = await signTransaction([params.signer], unsignedTx);
+  const extraSigners = params.privateFee ? [params.privateFee.feeSigner] : [];
+  const signed = await signTransaction([params.signer, ...extraSigners], unsignedTx);
   const envelope = await sealTransaction(signed);
   const transactionId = await submitTransaction(params.provider, envelope);
   const response = await withTimeout(pollTransactionResult(params.provider, transactionId), 60_000, params.timeoutLabel);
@@ -2395,6 +2658,35 @@ export function resolveUnshieldPlan(
     finalTotal += BigInt(extra.amount);
   }
   return { commitments: finalSelected.map((r) => r.commitment), remainder: finalTotal - revealedOutAmount };
+}
+
+/**
+ * Pure planning for `execute()`'s private-fee path: picks the smallest unspent stealth UTXO of
+ * `feeResourceAddress` that alone covers `maxFee`. Deliberately the *smallest* qualifying record
+ * (not the largest, and never several combined) -- `buildPrivateFeeInstructions` only supports a
+ * single fee input (see its own doc comment for why), so this leaves larger shielded balances
+ * untouched for whatever they were shielded for rather than reaching for them first.
+ */
+export function selectPrivateFeeUtxo(
+  records: ShieldedOutputRecord[],
+  feeResourceAddress: string,
+  maxFee: bigint,
+  exclude: string[] = []
+): ShieldedOutputRecord {
+  const excluded = new Set(exclude);
+  const candidates = records
+    .filter((r) => !r.spent && !excluded.has(r.commitment) && r.resourceAddress === feeResourceAddress && BigInt(r.amount) > maxFee)
+    .sort((a, b) => {
+      const diff = BigInt(a.amount) - BigInt(b.amount);
+      return diff > 0n ? 1 : diff < 0n ? -1 : 0;
+    });
+  const chosen = candidates[0];
+  if (!chosen) {
+    throw new Error(
+      `No single shielded ${feeResourceAddress} UTXO is large enough to cover a private fee of ${maxFee}. Shield some first (see shield()).`
+    );
+  }
+  return chosen;
 }
 
 /**
