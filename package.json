@@ -1,6 +1,6 @@
 {
   "name": "@chironbuilder/ootle-sdk",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Shared TypeScript client for Tari Ootle (L2): account derivation, balances, transactions, HTLCs, and stealth/confidential transfers — the account core behind Sapient and the Tari L1 web wallet's Ootle support.",
   "type": "module",
   "license": "MIT",
@@ -9,7 +9,13 @@
     "url": "git+https://github.com/chironbuilds/ootle-sdk-ts.git"
   },
   "homepage": "https://github.com/chironbuilds/ootle-sdk-ts",
-  "keywords": ["tari", "ootle", "wallet", "blockchain", "web3"],
+  "keywords": [
+    "tari",
+    "ootle",
+    "wallet",
+    "blockchain",
+    "web3"
+  ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -22,7 +28,10 @@
       "default": "./dist/adapters.js"
     }
   },
-  "files": ["dist", "vendor"],
+  "files": [
+    "dist",
+    "vendor"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
