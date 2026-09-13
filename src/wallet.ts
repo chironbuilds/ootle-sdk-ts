@@ -1154,7 +1154,11 @@ export class OotleAccount implements WalletAccountApi {
     feeType: FeeType = { kind: "transparent" },
   ): Promise<{ transactionId: string }> {
     const accountId = localAccountId(this.index);
-    const records = await listShieldedOutputs(accountId);
+    const records = await this.filterReadableShieldedOutputs(
+      await listShieldedOutputs(accountId),
+      resourceAddress,
+      revealedOutAmount
+    );
     const { commitments, remainder } = resolveUnshieldPlan(records, resourceAddress, revealedOutAmount);
     const dust = 1n;
 
@@ -1624,9 +1628,97 @@ export class OotleAccount implements WalletAccountApi {
   ): Promise<PrivateFeeMaterial | null> {
     if (feeType.kind !== "private") return null;
     const accountId = localAccountId(this.index);
-    const chosen = selectPrivateFeeUtxo(await listShieldedOutputs(accountId), feeType.feeResourceAddress, maxFee, exclude);
-    const built = await this.buildPrivateFeeInstructions(feeType.feeResourceAddress, chosen.commitment, maxFee);
-    return { ...built, spentCommitment: chosen.commitment };
+    const records = await listShieldedOutputs(accountId);
+    // Retries with the next-smallest qualifying UTXO if one fails to read -- confirmed live that a
+    // record this wallet still has as "unspent" can 500 on the indexer (consistent with it having
+    // actually been spent already, e.g. from another device/session sharing this seed, hitting an
+    // indexer bug serving a since-spent substate) rather than a clean not-found. Deliberately does
+    // NOT mark a failing candidate spent here: a 500 doesn't distinguish "genuinely spent" from "the
+    // indexer had a bad moment," and this wallet's only handle back to a real stealth output is this
+    // local record (see `ShieldedOutputRecord`'s own doc comment) -- wrongly deleting one on an
+    // ambiguous error is unrecoverable, so a failing candidate is only skipped for *this* attempt,
+    // tried again next time. Bounded by the exclude set strictly growing each iteration.
+    const tried = new Set(exclude);
+    let lastReadError: unknown;
+    for (;;) {
+      let chosen;
+      try {
+        chosen = selectPrivateFeeUtxo(records, feeType.feeResourceAddress, maxFee, [...tried]);
+      } catch (selectError) {
+        // Distinguishes "never had a large-enough candidate" (selectPrivateFeeUtxo's own clear
+        // error) from "had one or more, but every single one failed to read" -- the latter needs
+        // its own message naming the last read failure, or it looks identical to simply not having
+        // enough shielded balance.
+        if (lastReadError) {
+          throw new Error(
+            `Every shielded ${feeType.feeResourceAddress} UTXO large enough to cover a private fee of ${maxFee} failed to read from the network (last error: ${
+              lastReadError instanceof Error ? lastReadError.message : String(lastReadError)
+            }) -- one or more may already be spent, e.g. from another device or session sharing this seed.`,
+            { cause: lastReadError }
+          );
+        }
+        throw selectError;
+      }
+      try {
+        const built = await this.buildPrivateFeeInstructions(feeType.feeResourceAddress, chosen.commitment, maxFee);
+        return { ...built, spentCommitment: chosen.commitment };
+      } catch (e) {
+        lastReadError = e;
+        tried.add(chosen.commitment);
+      }
+    }
+  }
+
+  /**
+   * Filters out unspent local records for `resourceAddress` that can't actually be read right now
+   * (checked largest-first, stopping once verified-readable records cover `targetAmount` -- the
+   * same greedy order `selectShieldedUtxosForAmount` itself uses, so this does the minimum
+   * verification needed rather than checking every record up front) -- used by `sendPrivately()`
+   * and `unshield()` before their own coin-selection plan runs, so a record that's actually
+   * already spent (confirmed live: the indexer can 500 instead of cleanly saying so, e.g. for one
+   * spent through another device/session sharing this seed) gets skipped as a *candidate* instead
+   * of failing the whole transaction deep inside the `StealthTransfer` builder with no way to
+   * retry excluding just the bad one.
+   *
+   * Deliberately never marks a failing record spent in local storage -- same reasoning as
+   * `resolvePrivateFee`: an unreadable-right-now record could just as easily be a transient
+   * indexer error as a genuinely spent output, and this wallet's only handle back to a real
+   * stealth output is this local record (see `ShieldedOutputRecord`'s own doc comment), so wrongly
+   * deleting one is unrecoverable. A record skipped here is simply not offered as a candidate for
+   * *this* attempt; it stays in local storage to be tried again later.
+   */
+  private async filterReadableShieldedOutputs(
+    records: ShieldedOutputRecord[],
+    resourceAddress: string,
+    targetAmount: bigint
+  ): Promise<ShieldedOutputRecord[]> {
+    const provider = await this.getProvider();
+    const crypto = new WasmStealthCrypto(this.network);
+    const viewSecret = await this.signer.getViewSecret();
+    const candidates = records
+      .filter((r) => r.resourceAddress === resourceAddress && !r.spent)
+      .sort((a, b) => {
+        const diff = BigInt(b.amount) - BigInt(a.amount);
+        return diff > 0n ? 1 : diff < 0n ? -1 : 0;
+      });
+    const unreadable = new Set<string>();
+    let verifiedTotal = 0n;
+    for (const record of candidates) {
+      if (verifiedTotal >= targetAmount) break;
+      try {
+        const substateId = stealthUtxoSubstateId(resourceAddress, fromHex(record.commitment));
+        const substate = await provider.getSubstate(substateId);
+        const decrypted = await decryptOwnedUtxo(crypto, viewSecret, substate, substateId);
+        if (!decrypted) {
+          unreadable.add(record.commitment); // doesn't decrypt as ours -- don't offer it either
+          continue;
+        }
+        verifiedTotal += BigInt(record.amount);
+      } catch {
+        unreadable.add(record.commitment);
+      }
+    }
+    return records.filter((r) => !unreadable.has(r.commitment));
   }
 
   /**
@@ -2025,7 +2117,7 @@ export class OotleAccount implements WalletAccountApi {
   ): Promise<{ transactionId: string; recipientCommitment: string; recipientSubstateId: string; minimumValuePromise: string }> {
     assertValidMinimumValuePromise(minimumValuePromise, amount);
     const accountId = localAccountId(this.index);
-    const records = await listShieldedOutputs(accountId);
+    const records = await this.filterReadableShieldedOutputs(await listShieldedOutputs(accountId), resourceAddress, amount);
     const { commitments, changeAmount } = resolveSendPrivatelyPlan(records, resourceAddress, amount);
     const dust = 1n;
 
