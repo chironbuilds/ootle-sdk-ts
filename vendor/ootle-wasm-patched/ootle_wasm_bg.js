@@ -3,7 +3,6 @@
  */
 export class DecryptedOutputResult {
     static __wrap(ptr) {
-        ptr = ptr >>> 0;
         const obj = Object.create(DecryptedOutputResult.prototype);
         obj.__wbg_ptr = ptr;
         DecryptedOutputResultFinalization.register(obj, obj.__wbg_ptr, obj);
@@ -38,7 +37,7 @@ export class DecryptedOutputResult {
         const ret = wasm.__wbg_get_decryptedoutputresult_memo_json(this.__wbg_ptr);
         let v1;
         if (ret[0] !== 0) {
-            v1 = getStringFromWasm0(ret[0], ret[1]).slice();
+            v1 = getStringFromWasm0(ret[0], ret[1]);
             wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
         }
         return v1;
@@ -85,7 +84,6 @@ if (Symbol.dispose) DecryptedOutputResult.prototype[Symbol.dispose] = DecryptedO
  */
 export class KeypairResult {
     static __wrap(ptr) {
-        ptr = ptr >>> 0;
         const obj = Object.create(KeypairResult.prototype);
         obj.__wbg_ptr = ptr;
         KeypairResultFinalization.register(obj, obj.__wbg_ptr, obj);
@@ -143,7 +141,6 @@ if (Symbol.dispose) KeypairResult.prototype[Symbol.dispose] = KeypairResult.prot
  */
 export class OotlePublicKey {
     static __wrap(ptr) {
-        ptr = ptr >>> 0;
         const obj = Object.create(OotlePublicKey.prototype);
         obj.__wbg_ptr = ptr;
         OotlePublicKeyFinalization.register(obj, obj.__wbg_ptr, obj);
@@ -186,7 +183,7 @@ export class OotlePublicKey {
     set owner_key(arg0) {
         const ptr0 = passArray8ToWasm0(arg0, wasm.__wbindgen_malloc);
         const len0 = WASM_VECTOR_LEN;
-        wasm.__wbg_set_keypairresult_secret_key(this.__wbg_ptr, ptr0, len0);
+        wasm.__wbg_set_ootlepublickey_owner_key(this.__wbg_ptr, ptr0, len0);
     }
     /**
      * The view-only public key bytes.
@@ -195,7 +192,7 @@ export class OotlePublicKey {
     set view_key(arg0) {
         const ptr0 = passArray8ToWasm0(arg0, wasm.__wbindgen_malloc);
         const len0 = WASM_VECTOR_LEN;
-        wasm.__wbg_set_keypairresult_public_key(this.__wbg_ptr, ptr0, len0);
+        wasm.__wbg_set_ootlepublickey_view_key(this.__wbg_ptr, ptr0, len0);
     }
 }
 if (Symbol.dispose) OotlePublicKey.prototype[Symbol.dispose] = OotlePublicKey.prototype.free;
@@ -205,7 +202,6 @@ if (Symbol.dispose) OotlePublicKey.prototype[Symbol.dispose] = OotlePublicKey.pr
  */
 export class OotleSecretKey {
     static __wrap(ptr) {
-        ptr = ptr >>> 0;
         const obj = Object.create(OotleSecretKey.prototype);
         obj.__wbg_ptr = ptr;
         OotleSecretKeyFinalization.register(obj, obj.__wbg_ptr, obj);
@@ -248,7 +244,7 @@ export class OotleSecretKey {
     set owner_key(arg0) {
         const ptr0 = passArray8ToWasm0(arg0, wasm.__wbindgen_malloc);
         const len0 = WASM_VECTOR_LEN;
-        wasm.__wbg_set_keypairresult_secret_key(this.__wbg_ptr, ptr0, len0);
+        wasm.__wbg_set_ootlesecretkey_owner_key(this.__wbg_ptr, ptr0, len0);
     }
     /**
      * The view-only secret key bytes.
@@ -257,7 +253,7 @@ export class OotleSecretKey {
     set view_key(arg0) {
         const ptr0 = passArray8ToWasm0(arg0, wasm.__wbindgen_malloc);
         const len0 = WASM_VECTOR_LEN;
-        wasm.__wbg_set_keypairresult_public_key(this.__wbg_ptr, ptr0, len0);
+        wasm.__wbg_set_ootlesecretkey_view_key(this.__wbg_ptr, ptr0, len0);
     }
 }
 if (Symbol.dispose) OotleSecretKey.prototype[Symbol.dispose] = OotleSecretKey.prototype.free;
@@ -267,7 +263,6 @@ if (Symbol.dispose) OotleSecretKey.prototype[Symbol.dispose] = OotleSecretKey.pr
  */
 export class ParsedOotleAddress {
     static __wrap(ptr) {
-        ptr = ptr >>> 0;
         const obj = Object.create(ParsedOotleAddress.prototype);
         obj.__wbg_ptr = ptr;
         ParsedOotleAddressFinalization.register(obj, obj.__wbg_ptr, obj);
@@ -347,7 +342,7 @@ export class ParsedOotleAddress {
     set owner_key(arg0) {
         const ptr0 = passArray8ToWasm0(arg0, wasm.__wbindgen_malloc);
         const len0 = WASM_VECTOR_LEN;
-        wasm.__wbg_set_keypairresult_secret_key(this.__wbg_ptr, ptr0, len0);
+        wasm.__wbg_set_parsedootleaddress_owner_key(this.__wbg_ptr, ptr0, len0);
     }
     /**
      * The view-only public key bytes.
@@ -356,7 +351,7 @@ export class ParsedOotleAddress {
     set view_key(arg0) {
         const ptr0 = passArray8ToWasm0(arg0, wasm.__wbindgen_malloc);
         const len0 = WASM_VECTOR_LEN;
-        wasm.__wbg_set_keypairresult_public_key(this.__wbg_ptr, ptr0, len0);
+        wasm.__wbg_set_parsedootleaddress_view_key(this.__wbg_ptr, ptr0, len0);
     }
 }
 if (Symbol.dispose) ParsedOotleAddress.prototype[Symbol.dispose] = ParsedOotleAddress.prototype.free;
@@ -367,7 +362,6 @@ if (Symbol.dispose) ParsedOotleAddress.prototype[Symbol.dispose] = ParsedOotleAd
  */
 export class SchnorrSignatureResult {
     static __wrap(ptr) {
-        ptr = ptr >>> 0;
         const obj = Object.create(SchnorrSignatureResult.prototype);
         obj.__wbg_ptr = ptr;
         SchnorrSignatureResultFinalization.register(obj, obj.__wbg_ptr, obj);
@@ -407,7 +401,7 @@ export class SchnorrSignatureResult {
     set public_nonce(arg0) {
         const ptr0 = passArray8ToWasm0(arg0, wasm.__wbindgen_malloc);
         const len0 = WASM_VECTOR_LEN;
-        wasm.__wbg_set_keypairresult_secret_key(this.__wbg_ptr, ptr0, len0);
+        wasm.__wbg_set_schnorrsignatureresult_public_nonce(this.__wbg_ptr, ptr0, len0);
     }
     /**
      * @param {Uint8Array} arg0
@@ -415,7 +409,7 @@ export class SchnorrSignatureResult {
     set signature(arg0) {
         const ptr0 = passArray8ToWasm0(arg0, wasm.__wbindgen_malloc);
         const len0 = WASM_VECTOR_LEN;
-        wasm.__wbg_set_keypairresult_public_key(this.__wbg_ptr, ptr0, len0);
+        wasm.__wbg_set_schnorrsignatureresult_signature(this.__wbg_ptr, ptr0, len0);
     }
 }
 if (Symbol.dispose) SchnorrSignatureResult.prototype[Symbol.dispose] = SchnorrSignatureResult.prototype.free;
@@ -425,7 +419,6 @@ if (Symbol.dispose) SchnorrSignatureResult.prototype[Symbol.dispose] = SchnorrSi
  */
 export class StealthOutputsResult {
     static __wrap(ptr) {
-        ptr = ptr >>> 0;
         const obj = Object.create(StealthOutputsResult.prototype);
         obj.__wbg_ptr = ptr;
         StealthOutputsResultFinalization.register(obj, obj.__wbg_ptr, obj);
@@ -476,7 +469,7 @@ export class StealthOutputsResult {
     set aggregated_output_mask(arg0) {
         const ptr0 = passArray8ToWasm0(arg0, wasm.__wbindgen_malloc);
         const len0 = WASM_VECTOR_LEN;
-        wasm.__wbg_set_keypairresult_public_key(this.__wbg_ptr, ptr0, len0);
+        wasm.__wbg_set_stealthoutputsresult_aggregated_output_mask(this.__wbg_ptr, ptr0, len0);
     }
     /**
      * JSON-serialized `StealthOutputsStatement` (the wire-format payload).
@@ -485,7 +478,7 @@ export class StealthOutputsResult {
     set statement_json(arg0) {
         const ptr0 = passStringToWasm0(arg0, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
-        wasm.__wbg_set_keypairresult_secret_key(this.__wbg_ptr, ptr0, len0);
+        wasm.__wbg_set_stealthoutputsresult_statement_json(this.__wbg_ptr, ptr0, len0);
     }
 }
 if (Symbol.dispose) StealthOutputsResult.prototype[Symbol.dispose] = StealthOutputsResult.prototype.free;
@@ -1321,14 +1314,14 @@ export function validateStealthTransfer(transfer_json, view_key) {
         throw takeFromExternrefTable0(ret[0]);
     }
 }
-export function __wbg_Error_8c4e43fe74559d73(arg0, arg1) {
+export function __wbg_Error_67e7344beaa85059(arg0, arg1) {
     const ret = Error(getStringFromWasm0(arg0, arg1));
     return ret;
 }
-export function __wbg___wbindgen_throw_be289d5034ed271b(arg0, arg1) {
+export function __wbg___wbindgen_throw_5d9e815e6fdf150f(arg0, arg1) {
     throw new Error(getStringFromWasm0(arg0, arg1));
 }
-export function __wbg_getRandomValues_e9de607763a970bd() { return handleError(function (arg0, arg1) {
+export function __wbg_getRandomValues_47873ea553f6780e() { return handleError(function (arg0, arg1) {
     globalThis.crypto.getRandomValues(getArrayU8FromWasm0(arg0, arg1));
 }, arguments); }
 export function __wbindgen_init_externref_table() {
@@ -1342,25 +1335,25 @@ export function __wbindgen_init_externref_table() {
 }
 const DecryptedOutputResultFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
-    : new FinalizationRegistry(ptr => wasm.__wbg_decryptedoutputresult_free(ptr >>> 0, 1));
+    : new FinalizationRegistry(ptr => wasm.__wbg_decryptedoutputresult_free(ptr, 1));
 const KeypairResultFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
-    : new FinalizationRegistry(ptr => wasm.__wbg_keypairresult_free(ptr >>> 0, 1));
+    : new FinalizationRegistry(ptr => wasm.__wbg_keypairresult_free(ptr, 1));
 const OotlePublicKeyFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
-    : new FinalizationRegistry(ptr => wasm.__wbg_ootlepublickey_free(ptr >>> 0, 1));
+    : new FinalizationRegistry(ptr => wasm.__wbg_ootlepublickey_free(ptr, 1));
 const OotleSecretKeyFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
-    : new FinalizationRegistry(ptr => wasm.__wbg_ootlesecretkey_free(ptr >>> 0, 1));
+    : new FinalizationRegistry(ptr => wasm.__wbg_ootlesecretkey_free(ptr, 1));
 const ParsedOotleAddressFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
-    : new FinalizationRegistry(ptr => wasm.__wbg_parsedootleaddress_free(ptr >>> 0, 1));
+    : new FinalizationRegistry(ptr => wasm.__wbg_parsedootleaddress_free(ptr, 1));
 const SchnorrSignatureResultFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
-    : new FinalizationRegistry(ptr => wasm.__wbg_schnorrsignatureresult_free(ptr >>> 0, 1));
+    : new FinalizationRegistry(ptr => wasm.__wbg_schnorrsignatureresult_free(ptr, 1));
 const StealthOutputsResultFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
-    : new FinalizationRegistry(ptr => wasm.__wbg_stealthoutputsresult_free(ptr >>> 0, 1));
+    : new FinalizationRegistry(ptr => wasm.__wbg_stealthoutputsresult_free(ptr, 1));
 
 function addToExternrefTable0(obj) {
     const idx = wasm.__externref_table_alloc();
@@ -1374,8 +1367,7 @@ function getArrayU8FromWasm0(ptr, len) {
 }
 
 function getStringFromWasm0(ptr, len) {
-    ptr = ptr >>> 0;
-    return decodeText(ptr, len);
+    return decodeText(ptr >>> 0, len);
 }
 
 let cachedUint8ArrayMemory0 = null;

@@ -1,128 +1,97 @@
 # ootle-wasm
 
-Client-side WebAssembly crypto for [Tari Ootle](https://www.tari.com/) L2. Handles BOR encoding, transaction hashing, Schnorr signing, and key management — with output byte-identical to the native Rust implementation.
+Rust → WASM library providing client-side crypto operations for Tari Ootle L2.
 
-## Installation
+## Architecture
+
+- `core/` — Pure Rust library. All crypto/encoding logic lives here. Testable natively with `cargo test`.
+- `wasm/` — Thin `wasm-bindgen` shell. Accepts JSON strings, calls core, returns results.
+
+## Prerequisites
 
 ```bash
-npm install @tari-project/ootle-wasm
+# Install wasm-pack
+cargo install wasm-pack
+
+# (Optional) Install wasm-opt for size optimisation
+# macOS:
+brew install binaryen
+# or via cargo:
+cargo install wasm-opt
 ```
 
-## API
+## Build
 
-All keys and signatures are **`Uint8Array`** (raw 32-byte values).
+### Native (tests only)
 
-### `generateKeypair()`
-
-Generate a new random Ristretto255 keypair.
-
-```typescript
-import { generateKeypair } from "@tari-project/ootle-wasm";
-
-const { secret_key, public_key } = generateKeypair();
-// secret_key: Uint8Array (32 bytes)
-// public_key: Uint8Array (32 bytes)
+```bash
+cargo test -p ootle-wasm-core
 ```
 
-### `publicKeyFromSecretKey(secretKey)`
+### WASM
 
-Derive the public key from a secret key.
+```bash
+# Build for bundler (webpack, vite, rollup, esbuild)
+wasm-pack build crates/ootle_wasm/wasm --target bundler --release --out-dir ../../../pkg
 
-```typescript
-import { publicKeyFromSecretKey } from "@tari-project/ootle-wasm";
+# Build for Node.js
+wasm-pack build crates/ootle_wasm/wasm --target nodejs --release --out-dir ../../../pkg
 
-const publicKey = publicKeyFromSecretKey(secretKey);
-// publicKey: Uint8Array (32 bytes)
+# Build for web (no bundler)
+wasm-pack build crates/ootle_wasm/wasm --target web --release --out-dir ../../../pkg
 ```
 
-### `hashUnsignedTransaction(unsignedTxJson, sealSignerPublicKey)`
+The output goes to `pkg/` at the repo root containing:
 
-Hash an `UnsignedTransactionV1` for signing. Returns a 64-byte `Uint8Array` that should be passed to `schnorrSign`.
+- `ootle_wasm_bg.wasm` — the WASM binary
+- `ootle_wasm.js` — JS glue code
+- `ootle_wasm.d.ts` — TypeScript type definitions
 
-- `unsignedTxJson` — JSON-serialised `UnsignedTransactionV1`
-- `sealSignerPublicKey` — raw public key bytes of the account owner (seal signer)
+### Size optimisation (optional)
 
-```typescript
-import { hashUnsignedTransaction } from "@tari-project/ootle-wasm";
-
-const hash = hashUnsignedTransaction(
-  JSON.stringify(unsignedTransaction),
-  sealSignerPublicKey,
-);
+```bash
+wasm-opt -Oz --strip-debug --strip-producers pkg/ootle_wasm_bg.wasm -o pkg/ootle_wasm_bg.wasm
 ```
 
-### `schnorrSign(secretKey, message)`
+### Debug build (with panic hook)
 
-Schnorr-sign a message (typically the hash from `hashUnsignedTransaction`).
-
-```typescript
-import { schnorrSign } from "@tari-project/ootle-wasm";
-
-const { public_nonce, signature } = schnorrSign(secretKey, hash);
-// public_nonce: Uint8Array (32 bytes)
-// signature:    Uint8Array (32 bytes)
+```bash
+wasm-pack build crates/ootle_wasm/wasm --target bundler --dev --out-dir ../../../pkg -- --features debug
 ```
 
-### `borEncodeTransaction(transactionJson)`
+## WASM Exports
 
-BOR-encode a signed `Transaction` into a base64 `TransactionEnvelope` string, ready to submit to the network.
+| Function                  | Signature                                                                   | Description                                         |
+|---------------------------|-----------------------------------------------------------------------------|-----------------------------------------------------|
+| `borEncodeTransaction`    | `(transactionJson: string) → string`                                        | BOR-encode a Transaction JSON → base64 envelope     |
+| `hashUnsignedTransaction` | `(unsignedTxJson: string, sealSignerPubKeyHex: string) → Uint8Array`        | Hash an unsigned transaction for signing (64 bytes) |
+| `schnorrSign`             | `(secretKeyHex: string, message: Uint8Array) → { public_nonce, signature }` | Schnorr-sign a message                              |
+| `generateKeypair`         | `() → { secret_key, public_key }`                                           | Generate a random Ristretto keypair                 |
+| `publicKeyFromSecretKey`  | `(secretKeyHex: string) → string`                                           | Derive public key from secret key                   |
 
-```typescript
-import { borEncodeTransaction } from "@tari-project/ootle-wasm";
+All keys and signatures are lowercase hex-encoded strings.
 
-const envelope = borEncodeTransaction(JSON.stringify(transaction));
-```
-
-## Working with keys
-
-Keys and signatures are raw `Uint8Array` bytes. Convert to and from hex strings using the built-in methods (Node 22+, modern browsers):
-
-```typescript
-import { generateKeypair, publicKeyFromSecretKey } from "@tari-project/ootle-wasm";
-
-// Generate a keypair and display as hex
-const { secret_key, public_key } = generateKeypair();
-console.log("Public key:", public_key.toHex());
-
-// Load a key from a hex string
-const restored = Uint8Array.fromHex("a1b2c3...");
-const derivedPublicKey = publicKeyFromSecretKey(restored);
-```
-
-## Full example
+## Usage from JS/TS
 
 ```typescript
-import {
+import init, {
   generateKeypair,
-  publicKeyFromSecretKey,
-  hashUnsignedTransaction,
   schnorrSign,
+  hashUnsignedTransaction,
   borEncodeTransaction,
-} from "@tari-project/ootle-wasm";
+  publicKeyFromSecretKey,
+} from './pkg/ootle_wasm.js';
 
-// 1. Generate or load a keypair
+// Initialise the WASM module
+await init();
+
+// Generate a keypair
 const { secret_key, public_key } = generateKeypair();
 
-// 2. Build an unsigned transaction (application-specific)
-const unsignedTx = {
-  /* ... UnsignedTransactionV1 fields ... */
-};
+// Hash an unsigned transaction for signing
+const unsignedTxJson = JSON.stringify(unsignedTransaction);
+const hash = hashUnsignedTransaction(unsignedTxJson, sealSignerPublicKeyHex);
 
-// 3. Hash for signing
-const hash = hashUnsignedTransaction(JSON.stringify(unsignedTx), public_key);
-
-// 4. Sign
+// Sign the hash
 const { public_nonce, signature } = schnorrSign(secret_key, hash);
-
-// 5. Assemble the signed transaction and BOR-encode
-const signedTx = {
-  /* ... Transaction with signature attached ... */
-};
-const envelope = borEncodeTransaction(JSON.stringify(signedTx));
-
-// 6. Submit envelope to the Ootle network
 ```
-
-## License
-
-BSD-3-Clause
