@@ -62,6 +62,24 @@ See `src/wallet.ts`'s doc comments for the full `OotleAccount` surface — `send
 `shield`/`unshield`, `htlcFund`/`htlcClaim`/`htlcRefund`, `claimTestnetXtr`, `execute` (the general
 instruction-builder escape hatch, with automatic missing-input discovery and lock-contention retry).
 
+### Claiming a Minotari (L1) burn
+
+A burn addressed to this account's public key (`getPublicKey()`) is claimed with `claimBurn`. Build
+the proof from the L1 burn's claim material and its kernel merkle proof (a base node's
+`/generate_kernel_merkle_proof`), or read a `minotari_console_wallet` proof file:
+
+```ts
+import { assembleBurnClaimProof, parseConsoleWalletBurnProof } from "@chironbuilder/ootle-sdk";
+
+const proof = assembleBurnClaimProof(l1BurnParts, kernelMerkleProof);
+// or: const proof = parseConsoleWalletBurnProof(fileText);
+const { claimedAmount, commitment } = await account.claimBurn(proof, /* maxFee */ 2000n);
+```
+
+The claimed funds arrive as a stealth output owned by this account and are recorded in its private
+balance. Validators accept a burn only once its L1 block is well confirmed, so an early claim is
+rejected and can be retried.
+
 ## What's in here, and what isn't
 
 - **Account core** (`wallet.ts`): `OotleAccount`, balance/plan-resolution helpers, the transaction
@@ -69,6 +87,7 @@ instruction-builder escape hatch, with automatic missing-input discovery and loc
 - **Crypto/derivation**: `derivation.ts`, `domainHash.ts`, `componentAddress.ts`, `vault.ts`,
   `ownershipProof.ts`, `confidential.ts`.
 - **HTLC**: `htlc.ts`.
+- **L1 burn claims**: `burnClaim.ts` (proof assembly) + `OotleAccount.claimBurn`.
 - **Storage abstraction**: `storage.ts` + `adapters.ts`.
 - **Not included**: UI, an approval/permission model for dApp connections, address books, daemon
   (`tari_ootle_walletd`) relay support, transaction-history persistence. Those stay in each

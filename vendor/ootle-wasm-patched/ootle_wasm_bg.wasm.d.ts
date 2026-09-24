@@ -49,6 +49,7 @@ export const buildScriptPathWitness: (a: number, b: number, c: number, d: number
 export const buildStealthInputsStatement: (a: number, b: number, c: bigint) => [number, number, number, number];
 export const buildStealthInputsStatementFromInputs: (a: number, b: number, c: bigint) => [number, number, number, number];
 export const buildStealthTransferStatement: (a: number, b: number, c: bigint, d: number, e: number, f: bigint) => [number, number, number, number];
+export const burnClaimStealthSecret: (a: number, b: number, c: number, d: number) => [number, number, number, number];
 export const createConfidentialWithdrawProofLiteral: (a: number, b: number, c: bigint, d: number, e: number, f: bigint, g: number, h: number, i: bigint) => [number, number, number, number];
 export const createStealthOutputWitness: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: bigint) => [number, number, number, number];
 export const decryptElgamalViewableBalance: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: bigint, j: bigint) => [number, bigint, number, number];
@@ -70,6 +71,7 @@ export const sealTransaction: (a: number, b: number, c: number, d: number) => [n
 export const stealthDhSecret: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
 export const unblindOutput: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number];
 export const validateBalanceProofSignature: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number];
+export const validateBurnClaimOwnershipProof: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: bigint, i: number, j: number) => [number, number, number];
 export const validateStealthTransfer: (a: number, b: number, c: number, d: number) => [number, number];
 export const tari_free: (a: number) => void;
 export const tari_alloc: (a: number) => number;

@@ -4,7 +4,7 @@
   "collaborators": [
     "The Tari Development Community"
   ],
-  "description": "WASM bindings for Tari Ootle client-side crypto — thin wasm-bindgen shell over ootle-wasm-core. LOCAL VENDOR PATCH: adds createConfidentialWithdrawProofLiteral, built from tari-dan crates/ootle_wasm at commit ac73128 (v0.41.0, esmeralda V1 activation) plus the confidential.rs module added on top -- not yet in an upstream release.",
+  "description": "WASM bindings for Tari Ootle client-side crypto — thin wasm-bindgen shell over ootle-wasm-core. LOCAL VENDOR PATCH: adds createConfidentialWithdrawProofLiteral, built from tari-dan crates/ootle_wasm at commit ac73128 (v0.41.0, esmeralda V1 activation) plus the confidential.rs module and burn_claim exports (burnClaimStealthSecret, validateBurnClaimOwnershipProof) added on top -- not yet in an upstream release.",
   "version": "0.41.0",
   "license": "BSD-3-Clause",
   "repository": {

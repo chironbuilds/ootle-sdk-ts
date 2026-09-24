@@ -1,0 +1,21 @@
+{
+  "accountPublicHex": "4c0658223ebbaa8aa016e5c0c738c1dc4f92f5e5d439acb3772f308e12bab516",
+  "accountSecretHex": "6528835df9e826b880760ed44d6ba7834092e1235ea70263a18a1e89f2e7910b",
+  "amount": 1000000,
+  "commitmentHex": "ae3b8bbaa92137c69f8b2d2ecf261f43672d6555cc0f684b01a5055dcba07a0c",
+  "encryptedDataHex": "473cf464c0f0b59af1f8bda4875590c022b92ac8d990dfcb6439c08135592d346d7eb0005a8100646e83d9e2f46ba6ac850b1ad02839a298b3f7e9ef4dbf3408fac78468f8146ec2a4d6060bb6f1caf9",
+  "kernel": {
+    "excessHex": "d427bdbdb25699d63272977365b82b13640ce36e3ddf26a0d31a7d9e7c11d761",
+    "fee": 700,
+    "lockHeight": 0,
+    "nonceHex": "bcdc8e61764e2740c5bddb7e8e593ea6c3a22f5d173c0a979e67c4c0b75f6e23",
+    "signatureHex": "40af3bc69977c93c59fd81cb8a310d8a597fecc82a1a9ff8dd2edafb79da3609",
+    "version": 0
+  },
+  "network": "esmeralda",
+  "ownershipNonceHex": "363de6bbc8cc6aa43879d14487907ad2cddd1406f229b314e31e6633c6882839",
+  "ownershipSignatureHex": "b7eba54063835d9ac0e07c2f008c5cc58ed643050833c04622e2d0019e61c105",
+  "rangeProofPresent": true,
+  "senderOffsetPublicKeyHex": "eac8fa16f71c4a37c8c170d962886d080931f526b5c744e4ed3ea2080973b942",
+  "stealthClaimPublicHex": "f00354e89c48118262eaba29b99e1834707b3d8952d7fe052e84f5e528074c0c"
+}

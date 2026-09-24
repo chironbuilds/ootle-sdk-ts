@@ -730,6 +730,28 @@ export function buildStealthTransferStatement(input_witnesses_json, revealed_inp
 }
 
 /**
+ * Derive the stealth claim secret `s = H(p·R) + p` for claiming an L1 (minotari) burn, from the
+ * account secret `p` and the burn's sender offset public key `R`. The claim transaction must be
+ * sealed with this key.
+ * @param {Uint8Array} account_secret
+ * @param {Uint8Array} sender_offset_public_key
+ * @returns {Uint8Array}
+ */
+export function burnClaimStealthSecret(account_secret, sender_offset_public_key) {
+    const ptr0 = passArray8ToWasm0(account_secret, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passArray8ToWasm0(sender_offset_public_key, wasm.__wbindgen_malloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.burnClaimStealthSecret(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
  * Builds a `ConfidentialWithdrawProof` for the Account template's `withdraw_confidential` /
  * `join_confidential` methods, and returns it `tari_bor`-encoded -- ready to hex-encode and wrap
  * as an instruction `Literal` arg exactly like `microTariLiteral`/`amountLiteral` do for simpler
@@ -1287,6 +1309,35 @@ export function validateBalanceProofSignature(public_nonce, signature, inputs_st
     const ptr3 = passStringToWasm0(outputs_statement_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len3 = WASM_VECTOR_LEN;
     const ret = wasm.validateBalanceProofSignature(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return ret[0] !== 0;
+}
+
+/**
+ * Check an L1 burn's ownership proof against the stealth claim key derived from `stealth_secret`,
+ * exactly as a validator will. `false` means the claim would be rejected.
+ *
+ * `network` is the network byte (0x00 = MainNet, 0x10 = LocalNet, 0x26 = Esmeralda, ...).
+ * @param {number} network
+ * @param {Uint8Array} ownership_nonce
+ * @param {Uint8Array} ownership_signature
+ * @param {Uint8Array} commitment
+ * @param {bigint} value
+ * @param {Uint8Array} stealth_secret
+ * @returns {boolean}
+ */
+export function validateBurnClaimOwnershipProof(network, ownership_nonce, ownership_signature, commitment, value, stealth_secret) {
+    const ptr0 = passArray8ToWasm0(ownership_nonce, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passArray8ToWasm0(ownership_signature, wasm.__wbindgen_malloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passArray8ToWasm0(commitment, wasm.__wbindgen_malloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passArray8ToWasm0(stealth_secret, wasm.__wbindgen_malloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ret = wasm.validateBurnClaimOwnershipProof(network, ptr0, len0, ptr1, len1, ptr2, len2, value, ptr3, len3);
     if (ret[2]) {
         throw takeFromExternrefTable0(ret[1]);
     }

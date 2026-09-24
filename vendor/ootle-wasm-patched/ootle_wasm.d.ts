@@ -222,6 +222,13 @@ export function buildStealthInputsStatementFromInputs(inputs_json: string, revea
 export function buildStealthTransferStatement(input_witnesses_json: string, revealed_input_amount_microtari: bigint, output_witnesses_json: string, revealed_output_amount_microtari: bigint): string;
 
 /**
+ * Derive the stealth claim secret `s = H(p·R) + p` for claiming an L1 (minotari) burn, from the
+ * account secret `p` and the burn's sender offset public key `R`. The claim transaction must be
+ * sealed with this key.
+ */
+export function burnClaimStealthSecret(account_secret: Uint8Array, sender_offset_public_key: Uint8Array): Uint8Array;
+
+/**
  * Builds a `ConfidentialWithdrawProof` for the Account template's `withdraw_confidential` /
  * `join_confidential` methods, and returns it `tari_bor`-encoded -- ready to hex-encode and wrap
  * as an instruction `Literal` arg exactly like `microTariLiteral`/`amountLiteral` do for simpler
@@ -441,6 +448,14 @@ export function unblindOutput(output_commitment: Uint8Array, encrypted_data: Uin
  * the authoritative check at submission.
  */
 export function validateBalanceProofSignature(public_nonce: Uint8Array, signature: Uint8Array, inputs_statement_json: string, outputs_statement_json: string): boolean;
+
+/**
+ * Check an L1 burn's ownership proof against the stealth claim key derived from `stealth_secret`,
+ * exactly as a validator will. `false` means the claim would be rejected.
+ *
+ * `network` is the network byte (0x00 = MainNet, 0x10 = LocalNet, 0x26 = Esmeralda, ...).
+ */
+export function validateBurnClaimOwnershipProof(network: number, ownership_nonce: Uint8Array, ownership_signature: Uint8Array, commitment: Uint8Array, value: bigint, stealth_secret: Uint8Array): boolean;
 
 /**
  * Run the same validation the engine performs on a complete `StealthTransferStatement` envelope:

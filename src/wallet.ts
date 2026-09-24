@@ -7,6 +7,7 @@ import {
   StealthOutputsStatement,
   StealthTransfer,
   StealthTransferStatement,
+  TARI_RESOURCE_ADDRESS,
   TransactionBuilder,
   WalletStealthAuthorizer,
   WasmStealthCrypto,
@@ -43,6 +44,7 @@ import { IndexerProvider } from "@tari-project/ootle-indexer";
 import { SecretKeyWallet } from "@tari-project/ootle-secret-key-wallet";
 import {
   buildScriptPathWitness,
+  burnClaimStealthSecret,
   buildStealthTransferStatement,
   createConfidentialWithdrawProofLiteral,
   createStealthOutputWitness,
@@ -50,9 +52,11 @@ import {
   publicKeyFromSecretKey,
   schnorrSign,
   stealthDhSecret,
+  validateBurnClaimOwnershipProof,
   validateStealthTransfer,
 } from "@tari-project/ootle-wasm";
 import type { WalletAccountApi } from "./accountApi.js";
+import type { BurnClaimProofContents } from "./burnClaim.js";
 import { componentAddressFromWalletAddress, deriveAccountComponentAddress } from "./componentAddress.js";
 import { scanTransactionsForOwnedOutputs, sumConfidentialCommitments } from "./confidential.js";
 import type { ScannedStealthOutput } from "./confidential.js";
@@ -2222,6 +2226,102 @@ export class OotleAccount implements WalletAccountApi {
     // itself a stable, deterministic reference back to this exact output, so it fills that slot.
     await recordKnownShieldedOutput(accountId, resourceAddress, commitmentHex, decrypted.value, substateId, memo);
     return { amount: decrypted.value, memo };
+  }
+
+  /**
+   * Claims a Layer 1 (minotari) burn addressed to this account, minting the burned value on
+   * Ootle as a stealth output owned by this account (recorded locally, so it shows in the private
+   * balance). `maxFee` is revealed from the claimed value to pay the fee; the rest is claimed.
+   *
+   * The burn UTXO is minted and spent within the fee instructions, and the transaction is sealed
+   * with the stealth claim secret `s = H(p·R) + p` rather than the account key: the L1 ownership
+   * proof commits the burn to `s·G`, so `s` is the only key that satisfies its spend condition.
+   * Nothing here touches the account component, so the account need not exist on-chain yet.
+   *
+   * Validators only accept a burn once its L1 block is well confirmed; claiming earlier is
+   * rejected and can simply be retried later.
+   */
+  async claimBurn(
+    contents: BurnClaimProofContents,
+    maxFee = 2000n,
+    memo = "Burnt funds claimed from L1"
+  ): Promise<{ transactionId: string; claimedAmount: bigint; commitment: string }> {
+    if (maxFee <= 0n) throw new Error(`claimBurn: maxFee must be > 0, got ${maxFee}`);
+    const proof = contents.claim_proof;
+    const burnCommitment = fromHex(proof.commitment);
+    const senderOffset = fromHex(proof.sender_offset_public_key);
+    const value = BigInt(proof.value);
+
+    const stealthSecret = burnClaimStealthSecret(this.ownerSecret, senderOffset);
+    const ownershipValid = validateBurnClaimOwnershipProof(
+      this.network,
+      fromHex(proof.ownership_proof.public_nonce),
+      fromHex(proof.ownership_proof.signature),
+      burnCommitment,
+      value,
+      stealthSecret
+    );
+    if (!ownershipValid) {
+      throw new Error("This burn was not addressed to this account (its ownership proof does not verify).");
+    }
+
+    const crypto = new WasmStealthCrypto(this.network);
+    const aeadKey = await crypto.deriveAeadKey(this.ownerSecret, senderOffset);
+    const decrypted = await crypto.unblindOutput(burnCommitment, fromHex(contents.encrypted_data), aeadKey, true);
+    if (decrypted.value !== value) {
+      throw new Error(`claimBurn: burn proof states ${value} but the burn output holds ${decrypted.value}`);
+    }
+    const claimedAmount = decrypted.value - maxFee;
+    if (claimedAmount <= 0n) {
+      throw new Error(`claimBurn: the burn (${decrypted.value}) does not cover maxFee (${maxFee})`);
+    }
+
+    const walletAddress = await this.getWalletAddress();
+    const output = createOutput({ destination: walletAddress, amount: claimedAmount, resourceAddress: TARI_RESOURCE_ADDRESS, memo: toMemo(memo) });
+    const { statement: outputsStatement, outputMask } = await crypto.generateOutputsStatement([output], maxFee);
+    // The single input is the UTXO `ClaimBurn` mints in the same transaction; the instruction
+    // itself authorises spending it, so it carries no witness.
+    const inputsStatement = await crypto.buildInputsStatement([new StealthInput(burnCommitment)], 0n);
+    const inputMask = await crypto.aggregateInputMasks([decrypted.mask]);
+    const balanceProof = await crypto.generateBalanceProofSignature(
+      inputMask,
+      outputMask,
+      inputsStatement.statementJson!,
+      outputsStatement.statementJson
+    );
+    const statement = new StealthTransferStatement(inputsStatement, outputsStatement, balanceProof);
+    await crypto.validateTransfer(statement);
+    const ownCommitment = (outputsStatement.parsed() as { outputs: { output: { commitment: string } }[] }).outputs[0]!.output.commitment;
+
+    const provider = await this.getProvider();
+    const maxEpoch = await resolveMaxEpoch(provider);
+    const builder = TransactionBuilder.new(this.network, maxEpoch)
+      .addFeeInstruction({ ClaimBurn: { claim: proof, output_data: { encrypted_data: contents.encrypted_data } } } as unknown as Instruction)
+      .addFeeInstruction({
+        StealthTransfer: {
+          resource_address_ref: { Address: TARI_RESOURCE_ADDRESS },
+          statement: { __ootleRawJson: statement.toCompactJson() },
+          revealed_input_bucket: null,
+        },
+      } as unknown as Instruction)
+      .addFeeInstruction({ PutLastInstructionOutputOnWorkspace: { key: 0 } } as unknown as Instruction)
+      .addFeeInstruction({ PayFeeFromBucket: { bucket: { id: 0, offset: null } } } as unknown as Instruction)
+      .addInput({ substate_id: TARI_RESOURCE_ADDRESS, version: null });
+    // The seal key `s` is the transaction's only signer, so it must be authorized as the main
+    // signer; the TS builder leaves that off by default.
+    const unsignedBody = builder.buildUnsignedTransaction();
+    unsignedBody.is_seal_signer_authorized = true;
+    const unsignedTx = await resolveTransaction(provider, unsignedBody);
+
+    const signed = await signTransaction([], unsignedTx, {
+      secret_key: stealthSecret,
+      public_key: publicKeyFromSecretKey(stealthSecret),
+    });
+    const transactionId = await submitTransaction(provider, sealTransaction(signed));
+    const response = await withTimeout(pollTransactionResult(provider, transactionId), 90_000, "claiming the burn");
+    await recordKnownVersions(response);
+    await recordKnownShieldedOutput(localAccountId(this.index), TARI_RESOURCE_ADDRESS, ownCommitment, claimedAmount, transactionId, memo);
+    return { transactionId, claimedAmount, commitment: ownCommitment };
   }
 
   /**
