@@ -340,7 +340,10 @@ export class OotleAccount implements WalletAccountApi {
       // account and a degraded-indexer account the exact same way, with no indication anything's
       // actually wrong in the latter case.
       if (e instanceof Error && e.message.startsWith("Timed out")) throw e;
-      return []; // account not yet on-chain (never funded)
+      // Account not yet on-chain (never funded publicly). It can still hold stealth outputs -- a
+      // claimed L1 burn or a redeemed private payment needs no account component -- so the
+      // private ledger below is still read rather than returning empty here.
+      vaultIds = [];
     }
 
     // Fold in this account's own known-good stealth outputs (from shield()/unshield(), or from
@@ -2231,22 +2234,27 @@ export class OotleAccount implements WalletAccountApi {
   /**
    * Claims a Layer 1 (minotari) burn addressed to this account, minting the burned value on
    * Ootle as a stealth output owned by this account (recorded locally, so it shows in the private
-   * balance). `maxFee` is revealed from the claimed value to pay the fee; the rest is claimed.
+   * balance). The fee is revealed from the claimed value; the rest is claimed.
    *
    * The burn UTXO is minted and spent within the fee instructions, and the transaction is sealed
    * with the stealth claim secret `s = H(p·R) + p` rather than the account key: the L1 ownership
    * proof commits the burn to `s·G`, so `s` is the only key that satisfies its spend condition.
    * Nothing here touches the account component, so the account need not exist on-chain yet.
    *
+   * A fee paid purely by stealth reveal is not refundable -- whatever is revealed is kept -- so
+   * `maxFee` should sit on the required fee rather than above it. Left unset, it is measured: a
+   * dry run meters the claim, and the claim is submitted with that cost plus the engine's own
+   * estimate allowance (`FeeReceipt::required_fees`).
+   *
    * Validators only accept a burn once its L1 block is well confirmed; claiming earlier is
    * rejected and can simply be retried later.
    */
   async claimBurn(
     contents: BurnClaimProofContents,
-    maxFee = 2000n,
+    maxFee?: bigint,
     memo = "Burnt funds claimed from L1"
-  ): Promise<{ transactionId: string; claimedAmount: bigint; commitment: string }> {
-    if (maxFee <= 0n) throw new Error(`claimBurn: maxFee must be > 0, got ${maxFee}`);
+  ): Promise<{ transactionId: string; claimedAmount: bigint; commitment: string; fee: bigint }> {
+    if (maxFee !== undefined && maxFee <= 0n) throw new Error(`claimBurn: maxFee must be > 0, got ${maxFee}`);
     const proof = contents.claim_proof;
     const burnCommitment = fromHex(proof.commitment);
     const senderOffset = fromHex(proof.sender_offset_public_key);
@@ -2271,57 +2279,105 @@ export class OotleAccount implements WalletAccountApi {
     if (decrypted.value !== value) {
       throw new Error(`claimBurn: burn proof states ${value} but the burn output holds ${decrypted.value}`);
     }
-    const claimedAmount = decrypted.value - maxFee;
-    if (claimedAmount <= 0n) {
-      throw new Error(`claimBurn: the burn (${decrypted.value}) does not cover maxFee (${maxFee})`);
-    }
-
-    const walletAddress = await this.getWalletAddress();
-    const output = createOutput({ destination: walletAddress, amount: claimedAmount, resourceAddress: TARI_RESOURCE_ADDRESS, memo: toMemo(memo) });
-    const { statement: outputsStatement, outputMask } = await crypto.generateOutputsStatement([output], maxFee);
-    // The single input is the UTXO `ClaimBurn` mints in the same transaction; the instruction
-    // itself authorises spending it, so it carries no witness.
-    const inputsStatement = await crypto.buildInputsStatement([new StealthInput(burnCommitment)], 0n);
-    const inputMask = await crypto.aggregateInputMasks([decrypted.mask]);
-    const balanceProof = await crypto.generateBalanceProofSignature(
-      inputMask,
-      outputMask,
-      inputsStatement.statementJson!,
-      outputsStatement.statementJson
-    );
-    const statement = new StealthTransferStatement(inputsStatement, outputsStatement, balanceProof);
-    await crypto.validateTransfer(statement);
-    const ownCommitment = (outputsStatement.parsed() as { outputs: { output: { commitment: string } }[] }).outputs[0]!.output.commitment;
 
     const provider = await this.getProvider();
-    const maxEpoch = await resolveMaxEpoch(provider);
-    const builder = TransactionBuilder.new(this.network, maxEpoch)
-      .addFeeInstruction({ ClaimBurn: { claim: proof, output_data: { encrypted_data: contents.encrypted_data } } } as unknown as Instruction)
-      .addFeeInstruction({
-        StealthTransfer: {
-          resource_address_ref: { Address: TARI_RESOURCE_ADDRESS },
-          statement: { __ootleRawJson: statement.toCompactJson() },
-          revealed_input_bucket: null,
-        },
-      } as unknown as Instruction)
-      .addFeeInstruction({ PutLastInstructionOutputOnWorkspace: { key: 0 } } as unknown as Instruction)
-      .addFeeInstruction({ PayFeeFromBucket: { bucket: { id: 0, offset: null } } } as unknown as Instruction)
-      .addInput({ substate_id: TARI_RESOURCE_ADDRESS, version: null });
-    // The seal key `s` is the transaction's only signer, so it must be authorized as the main
-    // signer; the TS builder leaves that off by default.
-    const unsignedBody = builder.buildUnsignedTransaction();
-    unsignedBody.is_seal_signer_authorized = true;
-    const unsignedTx = await resolveTransaction(provider, unsignedBody);
+    const walletAddress = await this.getWalletAddress();
+    const sealKeypair = { secret_key: stealthSecret, public_key: publicKeyFromSecretKey(stealthSecret) };
 
-    const signed = await signTransaction([], unsignedTx, {
-      secret_key: stealthSecret,
-      public_key: publicKeyFromSecretKey(stealthSecret),
-    });
-    const transactionId = await submitTransaction(provider, sealTransaction(signed));
-    const response = await withTimeout(pollTransactionResult(provider, transactionId), 90_000, "claiming the burn");
+    // One claim transaction revealing `fee`. The output statement encodes the revealed amount, so
+    // every fee needs its own statement and proofs.
+    const buildClaim = async (fee: bigint, dryRun: boolean) => {
+      const claimedAmount = decrypted.value - fee;
+      if (claimedAmount <= 0n) {
+        throw new Error(`claimBurn: the burn (${decrypted.value}) does not cover the claim fee (${fee})`);
+      }
+      const output = createOutput({ destination: walletAddress, amount: claimedAmount, resourceAddress: TARI_RESOURCE_ADDRESS, memo: toMemo(memo) });
+      const { statement: outputsStatement, outputMask } = await crypto.generateOutputsStatement([output], fee);
+      // The single input is the UTXO `ClaimBurn` mints in the same transaction; the instruction
+      // itself authorises spending it, so it carries no witness.
+      const inputsStatement = await crypto.buildInputsStatement([new StealthInput(burnCommitment)], 0n);
+      const inputMask = await crypto.aggregateInputMasks([decrypted.mask]);
+      const balanceProof = await crypto.generateBalanceProofSignature(
+        inputMask,
+        outputMask,
+        inputsStatement.statementJson!,
+        outputsStatement.statementJson
+      );
+      const statement = new StealthTransferStatement(inputsStatement, outputsStatement, balanceProof);
+      await crypto.validateTransfer(statement);
+      const ownCommitment = (outputsStatement.parsed() as { outputs: { output: { commitment: string } }[] }).outputs[0]!.output.commitment;
+
+      const maxEpoch = await resolveMaxEpoch(provider);
+      const builder = TransactionBuilder.new(this.network, maxEpoch)
+        .addFeeInstruction({ ClaimBurn: { claim: proof, output_data: { encrypted_data: contents.encrypted_data } } } as unknown as Instruction)
+        .addFeeInstruction({
+          StealthTransfer: {
+            resource_address_ref: { Address: TARI_RESOURCE_ADDRESS },
+            statement: { __ootleRawJson: statement.toCompactJson() },
+            revealed_input_bucket: null,
+          },
+        } as unknown as Instruction)
+        .addFeeInstruction({ PutLastInstructionOutputOnWorkspace: { key: 0 } } as unknown as Instruction)
+        .addFeeInstruction({ PayFeeFromBucket: { bucket: { id: 0, offset: null } } } as unknown as Instruction)
+        .addInput({ substate_id: TARI_RESOURCE_ADDRESS, version: null });
+      // The seal key `s` is the transaction's only signer, so it must be authorized as the main
+      // signer; the TS builder leaves that off by default.
+      const unsignedBody = builder.buildUnsignedTransaction();
+      unsignedBody.is_seal_signer_authorized = true;
+      unsignedBody.dry_run = dryRun;
+      const unsignedTx = await resolveTransaction(provider, unsignedBody);
+      const signed = await signTransaction([], unsignedTx, sealKeypair);
+      return { envelope: sealTransaction(signed), claimedAmount, ownCommitment };
+    };
+
+    let fee = maxFee ?? (await this.estimateClaimFee(await buildClaim(claimFeeProbe(decrypted.value), true)));
+    let attempt = await buildClaim(fee, false);
+    let transactionId = await submitTransaction(provider, attempt.envelope);
+    let response: IndexerGetTransactionResultResponse;
+    try {
+      response = await withTimeout(pollTransactionResult(provider, transactionId), 90_000, "claiming the burn");
+    } catch (e) {
+      // A real run can meter a little differently from its dry run. When the rejection names the
+      // fee it wanted, a measured fee is resubmitted once at exactly that; an explicit one is not.
+      const required = maxFee === undefined ? requiredFeeFromRejection(e) : null;
+      if (required === null || required <= fee) throw e;
+      fee = required;
+      attempt = await buildClaim(fee, false);
+      transactionId = await submitTransaction(provider, attempt.envelope);
+      response = await withTimeout(pollTransactionResult(provider, transactionId), 90_000, "claiming the burn");
+    }
     await recordKnownVersions(response);
-    await recordKnownShieldedOutput(localAccountId(this.index), TARI_RESOURCE_ADDRESS, ownCommitment, claimedAmount, transactionId, memo);
-    return { transactionId, claimedAmount, commitment: ownCommitment };
+    await recordKnownShieldedOutput(localAccountId(this.index), TARI_RESOURCE_ADDRESS, attempt.ownCommitment, attempt.claimedAmount, transactionId, memo);
+    return { transactionId, claimedAmount: attempt.claimedAmount, commitment: attempt.ownCommitment, fee };
+  }
+
+  /** Dry-runs a sealed claim and returns the fee it needs: what it was charged plus the allowance. */
+  private async estimateClaimFee(dryRun: { envelope: string }): Promise<bigint> {
+    const res = await fetch(`${defaultIndexerUrl(this.network)}/transactions/dry-run`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ transaction: dryRun.envelope }),
+    });
+    const text = await res.text();
+    let body: { error?: { message?: string }; result?: ExecuteResult } | undefined;
+    try {
+      body = text ? JSON.parse(text) : undefined;
+    } catch {
+      // Not JSON — reported raw below.
+    }
+    if (!res.ok || body?.error || !body?.result) {
+      throw new Error(`Could not estimate the claim fee: ${body?.error?.message ?? text ?? res.statusText}`);
+    }
+    const finalize = body.result.finalize;
+    const outcome = finalize.result;
+    if (typeof outcome === "object" && outcome !== null && "Reject" in outcome) {
+      throw new Error(`Transaction ${finalize.transaction_hash ?? ""} was rejected: ${JSON.stringify(outcome.Reject)}`);
+    }
+    const breakdown = (finalize.fee_receipt?.cost_breakdown?.breakdown ?? {}) as Record<string, bigint | number | string | undefined>;
+    let charged = 0n;
+    for (const amount of Object.values(breakdown)) if (amount !== undefined) charged += BigInt(amount);
+    if (charged === 0n) throw new Error("Could not estimate the claim fee: the dry run reported no cost");
+    return charged + FEE_ESTIMATE_ALLOWANCE;
   }
 
   /**
@@ -2945,6 +3001,28 @@ export async function recoverPendingShields(provider: IndexerProvider): Promise<
       // from being reconciled -- leave this one in the list, it'll be retried next time.
     }
   }
+}
+
+/**
+ * `FEE_ESTIMATE_ALLOWANCE` in tari-ootle's `engine_types::fees`: a real run meters slightly
+ * differently from its dry run (the fee amount's own encoding feeds the cost), and this bounds the
+ * difference.
+ */
+const FEE_ESTIMATE_ALLOWANCE = 12n;
+
+/**
+ * The fee revealed while dry-running a claim. A dry run never charges it, but its width feeds the
+ * metered cost, so it sits well above any realistic claim cost while staying under the burn.
+ */
+function claimFeeProbe(burnValue: bigint): bigint {
+  const probe = 1_000_000n;
+  return burnValue > probe ? probe : burnValue - 1n;
+}
+
+/** The fee named by an `InsufficientFeesPaid` rejection ("Required fees N but M paid"), if any. */
+function requiredFeeFromRejection(e: unknown): bigint | null {
+  const match = /Required fees (\d+) but \d+ paid/.exec(e instanceof Error ? e.message : String(e));
+  return match ? BigInt(match[1]!) : null;
 }
 
 /**

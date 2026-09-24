@@ -73,7 +73,8 @@ import { assembleBurnClaimProof, parseConsoleWalletBurnProof } from "@chironbuil
 
 const proof = assembleBurnClaimProof(l1BurnParts, kernelMerkleProof);
 // or: const proof = parseConsoleWalletBurnProof(fileText);
-const { claimedAmount, commitment } = await account.claimBurn(proof, /* maxFee */ 2000n);
+// The fee is measured with a dry run; a stealth-revealed fee is never refunded, so it is not padded.
+const { claimedAmount, fee } = await account.claimBurn(proof);
 ```
 
 The claimed funds arrive as a stealth output owned by this account and are recorded in its private
