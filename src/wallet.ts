@@ -2860,7 +2860,9 @@ export class OotleAccount implements WalletAccountApi {
    * fee phase, the way Tari's own wallet unshields into a new account: the stealth inputs reveal
    * `amount + fee` (any excess returns as a stealth change output), `TakeFromBucket` splits off the
    * fee for `PayFeeFromBucket`, and `CreateAccount` creates this account from the rest. The fee is
-   * measured with a dry run first, since a fee revealed from stealth funds is never refunded.
+   * measured with a dry run first, since a fee revealed from stealth funds is never refunded. With no
+   * change to pay the fee from (unshielding the whole private balance), the fee comes out of the
+   * unshielded amount instead, so the account receives `amount` less the fee.
    *
    * The seal key is authorized as a signer and named as the revealed output's receiver
    * (tari-ootle#2645); each input's one-time key co-signs its key-path spend.
@@ -2901,13 +2903,16 @@ export class OotleAccount implements WalletAccountApi {
     const sealKeypair = generateSealKeypair();
 
     const build = async (fee: bigint, dryRun: boolean) => {
-      // The fee comes out of the stealth side: what's revealed is `amount + fee`, and the change
-      // output shrinks by `fee`.
-      const change = remainder - fee;
-      if (fee <= 0n || change < 0n) {
-        throw new Error(`unshield: the private balance does not cover ${amount} plus the ${fee} fee to create the account`);
+      // The fee comes out of the private change first. An account that doesn't exist has nothing
+      // else to pay with, so whatever the change can't cover (all of it, when unshielding the whole
+      // balance) comes out of the unshielded amount: the account is created with `amount - shortfall`.
+      const fromChange = fee < remainder ? fee : remainder;
+      const shortfall = fee - fromChange;
+      const change = remainder - fromChange;
+      if (fee <= 0n || shortfall >= amount) {
+        throw new Error(`unshield: ${amount + remainder} is not enough to cover the ${fee} fee to create the account`);
       }
-      const revealed = amount + fee;
+      const revealed = amount + fromChange;
       let outputsStatement: StealthOutputsStatement;
       let outputMask = Mask.zero();
       if (change > 0n) {
@@ -2964,7 +2969,9 @@ export class OotleAccount implements WalletAccountApi {
       return { envelope: sealTransaction(signed), change, changeCommitment };
     };
 
-    const probe = maxFee < remainder ? maxFee : remainder;
+    // Any fee the balance can pay works as the dry run's probe; it only feeds the metered cost.
+    const payable = remainder + amount - 1n;
+    const probe = maxFee < payable ? maxFee : payable;
     const fee = await this.estimateClaimFee(await build(probe, true), "unshield");
     if (fee > maxFee) throw new Error(`unshield: creating the account costs ${fee}, above the ${maxFee} limit`);
     const attempt = await build(fee, false);
