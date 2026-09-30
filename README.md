@@ -81,13 +81,57 @@ The claimed funds arrive as a stealth output owned by this account and are recor
 balance. Validators accept a burn only once its L1 block is well confirmed, so an early claim is
 rejected and can be retried.
 
+### HTLCs and atomic swaps
+
+`htlcFund` / `htlcClaim` / `htlcRefund` are built for settlement safety, not just for constructing
+the transactions:
+
+```ts
+// Lock 5,000 units of a stealth-created asset from exact private outputs. The fee stays in its own
+// native-TARI lane (here: private), the asset stays in the main lane, excess comes back as change.
+const fund = await account.htlcFund(asset, 5_000n, claimantAddress, hashLockHex, refundEpoch, 50_000n,
+  { kind: "private", feeResourceAddress: TARI }, { source: { kind: "stealth", commitments: [myUtxo] } });
+// fund.conditions → send to the claimant. fund.outputMask is also journaled (fund.journalId).
+
+// Claimant: nothing is revealed unless the funded output matches the agreed terms.
+const check = await account.verifyHtlc(asset, fund.ownCommitment, fund.conditions, { amount: 5_000n, minEpochsBeforeRefund: 3n });
+await account.htlcClaim(asset, fund.ownCommitment, fund.conditions, preimageHex, 50_000n, feeType,
+  { expected: { amount: 5_000n, refunderPublicKeyHex, minEpochsBeforeRefund: 3n } });
+
+// Funder, once currentEpoch >= refundEpoch:
+await account.refundFromJournal(fund.journalId);
+```
+
+- **Two lanes.** The fee (native TARI, public or a private UTXO) never shares a UTXO with the HTLC
+  value. `source: { kind: "stealth" }` spends this account's own stealth outputs of the resource,
+  so no public balance of it is needed.
+- **Dry run first.** Every fund/claim/refund dry-runs the exact transaction before the real submit
+  (`preflight: false` to skip — a claim's dry run sends the preimage to the indexer's dry-run
+  endpoint).
+- **Verified before the preimage leaves the device.** `htlcClaim` (and `verifyHtlc`) checks the
+  amount, that the claim leaf is your key and the refund leaf the agreed counterparty's, that the
+  on-chain condition root equals the tree's root, that the preimage matches the hash lock, and that
+  enough claim epochs remain; it throws `HtlcVerificationError` otherwise.
+- **Durable journal.** The sealed transaction, the condition tree and the HTLC output's mask (the
+  only thing that makes a refund possible) are persisted *before* submission. An ambiguous outcome
+  throws `HtlcUnknownOutcomeError` — "pending", never "failed" — and `reconcileHtlcs()` (call at
+  startup) resolves it by resubmitting the identical transaction and applying its bookkeeping.
+  `listHtlcs()` shows every operation and its state.
+- **Exact inputs are reserved** for the duration of an operation (and while its outcome is
+  unknown), so a concurrent send/unshield/fee selection can't pick them.
+- **Epoch rules match the engine:** the refund leaf is `AfterEpoch` (open when
+  `currentEpoch >= refundEpoch`), the claim leaf `BeforeEpoch` — see `isHtlcRefundable` /
+  `isHtlcClaimableByEpoch`.
+- Claimed and refunded outputs are recorded in the shielded ledger, so they're spendable at once.
+
 ## What's in here, and what isn't
 
 - **Account core** (`wallet.ts`): `OotleAccount`, balance/plan-resolution helpers, the transaction
   auto-resolve retry loop.
 - **Crypto/derivation**: `derivation.ts`, `domainHash.ts`, `componentAddress.ts`, `vault.ts`,
   `ownershipProof.ts`, `confidential.ts`.
-- **HTLC**: `htlc.ts`.
+- **HTLC**: `htlc.ts` (condition trees), `htlcSafety.ts` (epoch rules, pre-claim verification,
+  per-output masks, outcome classification) + the journaled `OotleAccount` HTLC methods.
 - **L1 burn claims**: `burnClaim.ts` (proof assembly) + `OotleAccount.claimBurn`.
 - **Storage abstraction**: `storage.ts` + `adapters.ts`.
 - **Not included**: UI, an approval/permission model for dApp connections, address books, daemon

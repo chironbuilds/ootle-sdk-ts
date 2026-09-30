@@ -69,12 +69,78 @@ export interface PendingShield {
   memo?: string;
 }
 
+/**
+ * Lifecycle of one HTLC operation, persisted *before* anything is submitted so a crash, a killed
+ * service worker or a confirmation timeout can never strand the only copy of what's needed to
+ * finish it (see `HtlcJournalEntry`):
+ *
+ * - `prepared`   the sealed envelope and every recovery field are stored; not yet submitted
+ * - `claim_armed` (claims only) the funded output passed every pre-claim check and a dry run; the
+ *                next step reveals the preimage on-chain
+ * - `submitted`  the network accepted the envelope for processing; outcome not yet known
+ * - `unknown`    submitted (or possibly submitted) but no final result arrived in time — resolved by
+ *                `OotleAccount.reconcileHtlcs()`, never assumed to have failed
+ * - `confirmed`  finalized and accepted; local bookkeeping done
+ * - `failed`     definitively rejected; nothing happened on-chain beyond (possibly) the fee
+ */
+export type HtlcJournalStatus = "prepared" | "claim_armed" | "submitted" | "unknown" | "confirmed" | "failed";
+
+export interface HtlcJournalEntry {
+  /** Local id, stable across retries of the same operation. */
+  id: string;
+  accountId: string;
+  kind: "fund" | "claim" | "refund";
+  status: HtlcJournalStatus;
+  resourceAddress: string;
+  /** Raw units. For a fund: the HTLC amount. For a claim/refund: the amount moving to this account. */
+  amount: string;
+  /** The exact two-leaf `[claim, refund]` condition tree — needed by both sides, never recomputable
+   * by the counterparty from on-chain data alone (only its root is committed). */
+  conditions: object[];
+  hashLockHex: string;
+  refundEpoch: string;
+  /** The HTLC output's commitment (hex): created by a fund, spent by a claim/refund. */
+  htlcCommitment?: string;
+  /** Fund only: the HTLC output's blinding mask. The funder can't decrypt an output addressed to the
+   * claimant, so without this a refund is impossible — which is why it is written here before submit. */
+  outputMask?: string;
+  /** This account's own new stealth output from the operation (a fund's change, a claim/refund's
+   * received output), recorded in the shielded ledger once the operation confirms. */
+  ownCommitment?: string;
+  ownAmount?: string;
+  /** Stealth inputs this operation spends (fund-from-stealth), marked spent once it confirms. */
+  spentCommitments?: string[];
+  /** Private-fee bookkeeping, applied once the operation confirms. */
+  privateFee?: { feeResourceAddress: string; spentCommitment: string; changeCommitment: string; changeAmount: string };
+  /** The sealed transaction exactly as submitted — lets reconciliation resubmit the identical
+   * transaction (same id, so it can never execute twice) if the first submit never reached the
+   * network. For a claim this contains the preimage, so it is only ever resubmitted, never shown. */
+  envelope: string;
+  transactionId?: string;
+  error?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** A stealth commitment held by an in-flight operation, so a concurrent one can't select it too. */
+export interface CommitmentReservation {
+  accountId: string;
+  commitment: string;
+  /** Who holds it — an operation id; the same holder may re-reserve idempotently. */
+  holder: string;
+  /** Epoch ms after which the reservation lapses on its own (a crashed operation can never lock a
+   * UTXO forever). */
+  expiresAt: number;
+}
+
 interface OotleState {
   shieldedOutputs: ShieldedOutputRecord[];
   pendingShields: PendingShield[];
   privatePaymentScanCursors: Record<string, string>;
   /** Substate versions already seen, so a resubmission does not re-lock a stale version. */
   knownVersions: Record<string, number>;
+  htlcJournal: HtlcJournalEntry[];
+  reservations: CommitmentReservation[];
 }
 
 const DEFAULTS: OotleState = {
@@ -82,6 +148,8 @@ const DEFAULTS: OotleState = {
   pendingShields: [],
   privatePaymentScanCursors: {},
   knownVersions: {},
+  htlcJournal: [],
+  reservations: [],
 };
 
 export function localAccountId(index: number): string {
@@ -142,9 +210,13 @@ export async function listShieldedOutputs(accountId: string): Promise<ShieldedOu
   return (await read()).shieldedOutputs.filter((r) => r.accountId === accountId);
 }
 
+/** Idempotent: a commitment already recorded for the same account is left as it is, so a
+ * reconciliation that re-applies a finished operation's bookkeeping can never double-count it. */
 export async function addShieldedOutput(record: ShieldedOutputRecord): Promise<void> {
   await serialized(async () => {
-    write({ shieldedOutputs: [...(await read()).shieldedOutputs, record] });
+    const existing = (await read()).shieldedOutputs;
+    if (existing.some((r) => r.accountId === record.accountId && r.commitment === record.commitment)) return;
+    await write({ shieldedOutputs: [...existing, record] });
   });
 }
 
@@ -199,6 +271,98 @@ export async function setKnownVersions(known: Record<string, number>): Promise<v
   await serialized(async () => {
     await write({ knownVersions: known });
   });
+}
+
+// ── HTLC journal ─────────────────────────────────────────────────────────────────────────────
+
+export async function listHtlcJournal(accountId?: string): Promise<HtlcJournalEntry[]> {
+  const all = (await read()).htlcJournal;
+  return accountId ? all.filter((e) => e.accountId === accountId) : all;
+}
+
+export async function getHtlcJournalEntry(id: string): Promise<HtlcJournalEntry | undefined> {
+  return (await read()).htlcJournal.find((e) => e.id === id);
+}
+
+/** Inserts or replaces (by id) — idempotent, so retrying the same write is always safe. */
+export async function putHtlcJournalEntry(entry: HtlcJournalEntry): Promise<void> {
+  await serialized(async () => {
+    const state = await read();
+    await write({ htlcJournal: [...state.htlcJournal.filter((e) => e.id !== entry.id), entry] });
+  });
+}
+
+/** Applies `patch` to an existing entry and bumps `updatedAt`. A missing id is a no-op. */
+export async function updateHtlcJournalEntry(id: string, patch: Partial<HtlcJournalEntry>): Promise<HtlcJournalEntry | undefined> {
+  return serialized(async () => {
+    const state = await read();
+    const current = state.htlcJournal.find((e) => e.id === id);
+    if (!current) return undefined;
+    const next = { ...current, ...patch, id, updatedAt: Date.now() };
+    await write({ htlcJournal: state.htlcJournal.map((e) => (e.id === id ? next : e)) });
+    return next;
+  });
+}
+
+// ── commitment reservations ──────────────────────────────────────────────────────────────────
+
+/** Default lifetime of a reservation: long enough for any single operation (prepare + dry run +
+ * submit + confirmation), short enough that a crashed one frees its UTXOs within minutes. */
+export const RESERVATION_TTL_MS = 10 * 60_000;
+
+/** Commitments currently reserved for `accountId` by anyone other than `exceptHolder`. */
+export async function listReservedCommitments(accountId: string, exceptHolder?: string, now = Date.now()): Promise<Set<string>> {
+  return new Set(
+    (await read()).reservations
+      .filter((r) => r.accountId === accountId && r.expiresAt > now && r.holder !== exceptHolder)
+      .map((r) => r.commitment),
+  );
+}
+
+/**
+ * Atomically reserves every commitment in `commitments` for `holder`, or none of them: if any is
+ * already held (unexpired) by a different holder, throws `CommitmentReservedError` naming them and
+ * writes nothing. Re-reserving one's own commitments just extends the lease. Expired leases are
+ * swept on every call.
+ */
+export async function reserveCommitments(
+  accountId: string,
+  commitments: string[],
+  holder: string,
+  ttlMs = RESERVATION_TTL_MS,
+): Promise<void> {
+  if (commitments.length === 0) return;
+  await serialized(async () => {
+    const now = Date.now();
+    const state = await read();
+    const live = state.reservations.filter((r) => r.expiresAt > now);
+    const taken = commitments.filter((c) => live.some((r) => r.accountId === accountId && r.commitment === c && r.holder !== holder));
+    if (taken.length > 0) throw new CommitmentReservedError(taken);
+    const wanted = new Set(commitments);
+    const kept = live.filter((r) => !(r.accountId === accountId && wanted.has(r.commitment)));
+    const expiresAt = now + ttlMs;
+    await write({ reservations: [...kept, ...commitments.map((commitment) => ({ accountId, commitment, holder, expiresAt }))] });
+  });
+}
+
+/** Releases every reservation `holder` holds (all accounts). Safe to call more than once. */
+export async function releaseReservations(holder: string): Promise<void> {
+  await serialized(async () => {
+    const now = Date.now();
+    const state = await read();
+    await write({ reservations: state.reservations.filter((r) => r.holder !== holder && r.expiresAt > now) });
+  });
+}
+
+export class CommitmentReservedError extends Error {
+  constructor(public readonly commitments: string[]) {
+    super(
+      `${commitments.length === 1 ? "A private output this operation needs is" : "Private outputs this operation needs are"} ` +
+        `already in use by another operation in progress (${commitments.map((c) => c.slice(0, 12)).join(", ")}). ` +
+        "Wait for it to finish, then try again.",
+    );
+    this.name = "CommitmentReservedError";
+  }
 }
 
 /** Clears every key this module owns -- call this from a host's own "erase wallet" flow. Does not

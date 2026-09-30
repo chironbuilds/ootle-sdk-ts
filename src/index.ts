@@ -24,6 +24,20 @@ export { DomainSeparatedHasher, KEY_MANAGER_DOMAIN, KEY_MANAGER_DOMAIN_VERSION, 
 export type { HtlcConditionsParams } from "./htlc.js";
 export { accessRuleRequiringPublicKey, htlcConditions } from "./htlc.js";
 
+export type { HtlcExpectations, HtlcFacts } from "./htlcSafety.js";
+export {
+  HtlcUnknownOutcomeError,
+  HtlcVerificationError,
+  conditionRootOf,
+  describeHtlcConditions,
+  epochsUntilRefund,
+  findScriptRoot,
+  isDefinitiveRejection,
+  isHtlcClaimableByEpoch,
+  isHtlcRefundable,
+  verifyHtlcTerms,
+} from "./htlcSafety.js";
+
 export type { NetworkName } from "./ootleNetwork.js";
 export { toOotleNetwork } from "./ootleNetwork.js";
 
@@ -34,7 +48,7 @@ export { decryptVault, encryptVault, fromHex, toHex } from "./vault.js";
 
 export { withTimeout } from "./timeout.js";
 
-export type { KeyValueStore, PendingShield, ShieldedOutputRecord } from "./storage.js";
+export type { CommitmentReservation, HtlcJournalEntry, HtlcJournalStatus, KeyValueStore, PendingShield, ShieldedOutputRecord } from "./storage.js";
 export {
   addPendingShield,
   addShieldedOutput,
@@ -50,11 +64,14 @@ export {
   setKnownVersions,
   setPrivatePaymentScanCursor,
   wipeOotleState,
+  CommitmentReservedError,
+  RESERVATION_TTL_MS,
+  listHtlcJournal,
 } from "./storage.js";
 
 export { chromeStorageAdapter, inMemoryAdapter, localStorageAdapter } from "./adapters.js";
 
-export type { FeeType, PrivateBalance, TokenBalance } from "./wallet.js";
+export type { FeeType, HtlcClaimOptions, HtlcFundOptions, HtlcFundResult, HtlcSpendResult, PrivateBalance, TokenBalance } from "./wallet.js";
 export {
   OotleAccount,
   assertValidMinimumValuePromise,

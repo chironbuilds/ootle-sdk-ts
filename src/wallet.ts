@@ -48,10 +48,12 @@ import {
   buildStealthTransferStatement,
   createConfidentialWithdrawProofLiteral,
   createStealthOutputWitness,
+  encryptedDataDhKdfAead,
   parseOotleAddress,
   publicKeyFromSecretKey,
   schnorrSign,
   stealthDhSecret,
+  unblindOutput,
   validateBurnClaimOwnershipProof,
   validateStealthTransfer,
 } from "@tari-project/ootle-wasm";
@@ -62,22 +64,46 @@ import { scanTransactionsForOwnedOutputs, sumConfidentialCommitments } from "./c
 import type { ScannedStealthOutput } from "./confidential.js";
 import { deriveAccountKeys } from "./derivation.js";
 import { htlcConditions } from "./htlc.js";
+import {
+  HtlcUnknownOutcomeError,
+  HtlcVerificationError,
+  type HtlcExpectations,
+  decryptOwnStatementOutput,
+  describeHtlcConditions,
+  findScriptRoot,
+  isDefinitiveRejection,
+  isHtlcRefundable,
+  newOperationId,
+  sha256Hex,
+  statementInputCommitment,
+  statementOutputCommitment,
+  subtractScalars,
+  verifyHtlcTerms,
+} from "./htlcSafety.js";
 import { buildOwnershipProofMessage, buildWalletOwnershipMessage } from "./ownershipProof.js";
 import { type NetworkName, toOotleNetwork } from "./ootleNetwork.js";
 import {
   addPendingShield,
   addShieldedOutput,
+  getHtlcJournalEntry,
   getKnownVersions,
   getPrivatePaymentScanCursor,
+  listHtlcJournal,
   listPendingShields,
+  listReservedCommitments,
   listShieldedOutputs,
   localAccountId,
   markShieldedOutputSpent,
+  putHtlcJournalEntry,
+  releaseReservations,
   removePendingShield,
+  reserveCommitments,
   setKnownVersions,
   setPrivatePaymentScanCursor,
+  updateHtlcJournalEntry,
+  CommitmentReservedError,
 } from "./storage.js";
-import type { ShieldedOutputRecord } from "./storage.js";
+import type { HtlcJournalEntry, ShieldedOutputRecord } from "./storage.js";
 import { withTimeout } from "./timeout.js";
 import { fromHex, toHex } from "./vault.js";
 
@@ -97,6 +123,60 @@ type PrivateFeeMaterial = {
   feeSigner: Signer;
   spentCommitment: string;
 };
+
+/** Options for `OotleAccount.htlcFund` (all optional; the defaults keep the original behavior). */
+export interface HtlcFundOptions {
+  /**
+   * Where the locked value comes from. `revealed` (default): this account's public balance of the
+   * resource. `stealth`: this account's own stealth outputs of it -- exactly `commitments` when
+   * given, otherwise selected automatically -- with any excess returned as same-resource stealth
+   * change. The fee always stays in its own native-TARI lane either way (see `FeeType`).
+   */
+  source?: { kind: "revealed" } | { kind: "stealth"; commitments?: string[] };
+  /** Dry-run the exact transaction before submitting it (default true). */
+  preflight?: boolean;
+}
+
+export interface HtlcFundResult {
+  transactionId: string;
+  /** The full `[claim, refund]` tree -- hand it to the claimant; only its root is on-chain. */
+  conditions: object[];
+  /** The HTLC output's commitment (named `ownCommitment` for backward compatibility). */
+  ownCommitment: string;
+  /** The HTLC output's own blinding mask -- required for a refund (also kept in the journal). */
+  outputMask: string;
+  /** This account's same-resource change output, when a stealth-sourced fund had change. */
+  changeCommitment?: string;
+  /** HTLC journal entry id (see `listHtlcs` / `reconcileHtlcs` / `refundFromJournal`). */
+  journalId: string;
+}
+
+/** Options for `OotleAccount.htlcClaim`. */
+export interface HtlcClaimOptions {
+  /** The agreed terms, checked against the chain before the preimage is revealed. */
+  expected?: HtlcExpectations;
+  /** Dry-run the exact claim before submitting it (default true). */
+  preflight?: boolean;
+}
+
+export interface HtlcSpendResult {
+  transactionId: string;
+  /** The new, normal stealth output this account received -- already recorded as spendable. */
+  receivedCommitment: string;
+  amount: bigint;
+  journalId: string;
+}
+
+/** A private fee's bookkeeping, in the journal's serializable form. */
+function journalFee(feeType: FeeType, fee: PrivateFeeMaterial | null): HtlcJournalEntry["privateFee"] {
+  if (!fee || feeType.kind !== "private") return undefined;
+  return {
+    feeResourceAddress: feeType.feeResourceAddress,
+    spentCommitment: fee.spentCommitment,
+    changeCommitment: fee.feeChangeCommitment,
+    changeAmount: fee.feeChangeAmount.toString(),
+  };
+}
 
 export interface TokenBalance {
   resourceAddress: string;
@@ -1161,71 +1241,79 @@ export class OotleAccount implements WalletAccountApi {
     feeType: FeeType = { kind: "transparent" },
   ): Promise<{ transactionId: string }> {
     const accountId = localAccountId(this.index);
+    const opId = newOperationId("unshield");
+    const unavailable = await this.unavailableCommitments(accountId, opId);
     const records = await this.filterReadableShieldedOutputs(
-      await listShieldedOutputs(accountId),
+      (await listShieldedOutputs(accountId)).filter((r) => !unavailable.has(r.commitment)),
       resourceAddress,
       revealedOutAmount
     );
     const { commitments, remainder } = resolveUnshieldPlan(records, resourceAddress, revealedOutAmount);
-    const dust = 1n;
-
-    const provider = await this.getProvider();
-    const account = await this.getComponentAddress();
-    // See shield()'s comment: Output.destination needs the bech32m wallet address, not the
-    // on-chain component address.
-    const walletAddress = await this.getWalletAddress();
-
-    // See shield()'s comment: the resource's own substate must be pinned explicitly -- prepare()
-    // never adds it on its own.
-    let builder = new StealthTransfer(provider, resourceAddress)
-      .withBuilder((b) => b.addInput({ substate_id: resourceAddress, version: null }))
-      .spendRevealedInput(account, dust);
-    for (const commitment of commitments) {
-      builder = builder.spendStealthInput(account, fromHex(commitment));
-    }
-    builder = builder
-      .toStealthOutput(createOutput({ destination: walletAddress, amount: remainder, resourceAddress, memo: toMemo(memo) }))
-      .toRevealedOutput(revealedOutAmount + dust);
-
-    const viewSecret = await this.signer.getViewSecret();
-    // See shield()'s comment: must pass this account's real network, not fromSpec's LocalNet
-    // default. `commitments` is excluded from the fee UTXO's own selection so the same shielded
-    // record can never be spent twice in one transaction (as both a main input here and the fee
-    // input) when `resourceAddress` and the fee's resource happen to be the same currency.
-    const { transactionId, spec, privateFee } = await this.prepareSignSubmit(
-      builder,
-      provider,
-      account,
-      maxFee,
-      feeType,
-      { viewSecret },
-      commitments
-    );
-    const ownCommitment = extractOutputCommitment(spec, 0);
-
-    await addPendingShield({
-      transactionId,
-      accountId,
-      resourceAddress,
-      amount: remainder.toString(),
-      spentCommitments: commitments,
-      ownCommitment,
-      memo,
-    });
+    await reserveCommitments(accountId, commitments, opId);
     try {
-      const response = await withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the unshield transaction");
-      await recordKnownVersions(response);
-      await recordKnownShieldedOutput(accountId, resourceAddress, ownCommitment, remainder, transactionId, memo);
+      const dust = 1n;
+
+      const provider = await this.getProvider();
+      const account = await this.getComponentAddress();
+      // See shield()'s comment: Output.destination needs the bech32m wallet address, not the
+      // on-chain component address.
+      const walletAddress = await this.getWalletAddress();
+
+      // See shield()'s comment: the resource's own substate must be pinned explicitly -- prepare()
+      // never adds it on its own.
+      let builder = new StealthTransfer(provider, resourceAddress)
+        .withBuilder((b) => b.addInput({ substate_id: resourceAddress, version: null }))
+        .spendRevealedInput(account, dust);
       for (const commitment of commitments) {
-        await markShieldedOutputSpent(accountId, commitment);
+        builder = builder.spendStealthInput(account, fromHex(commitment));
       }
-      if (privateFee && feeType.kind === "private") {
-        await this.recordPrivateFeeSpend(accountId, feeType.feeResourceAddress, privateFee, transactionId);
+      builder = builder
+        .toStealthOutput(createOutput({ destination: walletAddress, amount: remainder, resourceAddress, memo: toMemo(memo) }))
+        .toRevealedOutput(revealedOutAmount + dust);
+
+      const viewSecret = await this.signer.getViewSecret();
+      // See shield()'s comment: must pass this account's real network, not fromSpec's LocalNet
+      // default. `commitments` is excluded from the fee UTXO's own selection so the same shielded
+      // record can never be spent twice in one transaction (as both a main input here and the fee
+      // input) when `resourceAddress` and the fee's resource happen to be the same currency.
+      const { transactionId, spec, privateFee } = await this.prepareSignSubmit(
+        builder,
+        provider,
+        account,
+        maxFee,
+        feeType,
+        { viewSecret },
+        commitments,
+        opId
+      );
+      const ownCommitment = extractOutputCommitment(spec, 0);
+
+      await addPendingShield({
+        transactionId,
+        accountId,
+        resourceAddress,
+        amount: remainder.toString(),
+        spentCommitments: commitments,
+        ownCommitment,
+        memo,
+      });
+      try {
+        const response = await withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the unshield transaction");
+        await recordKnownVersions(response);
+        await recordKnownShieldedOutput(accountId, resourceAddress, ownCommitment, remainder, transactionId, memo);
+        for (const commitment of commitments) {
+          await markShieldedOutputSpent(accountId, commitment);
+        }
+        if (privateFee && feeType.kind === "private") {
+          await this.recordPrivateFeeSpend(accountId, feeType.feeResourceAddress, privateFee, transactionId);
+        }
+      } finally {
+        await removePendingShield(transactionId);
       }
+      return { transactionId };
     } finally {
-      await removePendingShield(transactionId);
+      await releaseReservations(opId);
     }
-    return { transactionId };
   }
 
   /**
@@ -1631,11 +1719,16 @@ export class OotleAccount implements WalletAccountApi {
     /** Commitments already claimed by the operation's own main effect (e.g. `unshield()`'s or
      * `sendPrivately()`'s own multi-UTXO coin selection) -- excluded so the same commitment can
      * never be selected as both a main input and the fee input in one transaction. */
-    exclude: string[] = []
+    exclude: string[] = [],
+    /** When set, the chosen fee UTXO is reserved for this operation (see `reserveCommitments`) so a
+     * concurrent operation can't pick it too. Whether set or not, UTXOs another operation has
+     * reserved are never chosen. */
+    reservationHolder?: string
   ): Promise<PrivateFeeMaterial | null> {
     if (feeType.kind !== "private") return null;
     const accountId = localAccountId(this.index);
     const records = await listShieldedOutputs(accountId);
+    for (const unavailable of await this.unavailableCommitments(accountId, reservationHolder)) exclude = [...exclude, unavailable];
     // Retries with the next-smallest qualifying UTXO if one fails to read -- confirmed live that a
     // record this wallet still has as "unspent" can 500 on the indexer (consistent with it having
     // actually been spent already, e.g. from another device/session sharing this seed, hitting an
@@ -1665,6 +1758,15 @@ export class OotleAccount implements WalletAccountApi {
           );
         }
         throw selectError;
+      }
+      if (reservationHolder) {
+        try {
+          await reserveCommitments(accountId, [chosen.commitment], reservationHolder);
+        } catch (e) {
+          if (!(e instanceof CommitmentReservedError)) throw e;
+          tried.add(chosen.commitment); // taken by a concurrent operation since we listed -- try the next one
+          continue;
+        }
       }
       try {
         const built = await this.buildPrivateFeeInstructions(feeType.feeResourceAddress, chosen.commitment, maxFee);
@@ -1749,18 +1851,100 @@ export class OotleAccount implements WalletAccountApi {
     feeType: FeeType,
     authorizerOpts: { viewSecret?: Uint8Array } = {},
     /** See `resolvePrivateFee`'s own doc comment. */
-    excludeFromFeeSelection: string[] = []
+    excludeFromFeeSelection: string[] = [],
+    reservationHolder?: string
   ): Promise<{ transactionId: string; spec: StealthTransferSpec; privateFee: PrivateFeeMaterial | null }> {
-    const privateFee = await this.resolvePrivateFee(feeType, maxFee, excludeFromFeeSelection);
-    const spec = await (privateFee ? this.attachPrivateFee(builder, privateFee) : builder.payFeeFromRevealed(maxFee)).prepare();
+    const { envelope, spec, privateFee } = await this.sealStealthTransfer(builder, provider, account, maxFee, feeType, {
+      authorizerOpts,
+      excludeFromFeeSelection,
+      reservationHolder,
+    });
+    const transactionId = await submitTransaction(provider, envelope);
+    return { transactionId, spec, privateFee };
+  }
+
+  /**
+   * The prepare/authorize/seal half of `prepareSignSubmit`, without the submit — so the exact same
+   * transaction shape can be dry-run first (`dryRun: true` marks it before it's signed) and so the
+   * sealed envelope can be journaled before it ever reaches the network.
+   *
+   * `sourceless`: the operation's main lane spends only stealth inputs (no `spendRevealedInput` of
+   * its resource at all — e.g. a stealth-created asset this account holds no public balance of).
+   * A transparent fee then can't use `payFeeFromRevealed` (which needs a revealed source of the
+   * *operation's* resource); instead it's paid in native TARI straight from `account` — the fee
+   * lane — with the account and its vaults registered as inputs, exactly as `submitHtlcSpend` does.
+   * A private fee needs no special handling: it never touched the revealed source anyway.
+   */
+  private async sealStealthTransfer(
+    builder: StealthTransfer,
+    provider: IndexerProvider,
+    account: string,
+    maxFee: bigint,
+    feeType: FeeType,
+    opts: {
+      authorizerOpts?: { viewSecret?: Uint8Array };
+      excludeFromFeeSelection?: string[];
+      reservationHolder?: string;
+      dryRun?: boolean;
+      sourceless?: boolean;
+    } = {}
+  ): Promise<{ envelope: string; spec: StealthTransferSpec; privateFee: PrivateFeeMaterial | null }> {
+    const privateFee = await this.resolvePrivateFee(feeType, maxFee, opts.excludeFromFeeSelection ?? [], opts.reservationHolder);
+    let withFee: StealthTransfer;
+    if (privateFee) {
+      withFee = this.attachPrivateFee(builder, privateFee);
+    } else if (opts.sourceless) {
+      const vaults = await getVaultIdsForAccount(provider, account);
+      withFee = builder.withBuilder((b) => {
+        b.feeTransactionPayFromComponent(account, maxFee);
+        b.addInput({ substate_id: account, version: null });
+        for (const vaultId of vaults) b.addInput({ substate_id: vaultId, version: null });
+        return b;
+      });
+    } else {
+      withFee = builder.payFeeFromRevealed(maxFee);
+    }
+    const spec = await withFee.prepare();
+    // `dry_run` is part of the signed transaction, so it must be set before authorization/sealing.
+    if (opts.dryRun) (spec.unsignedTx as { dry_run?: boolean }).dry_run = true;
     const wallet = new OotleWallet().registerKeyProvider(account, this.signer).setDefaultSigner(account);
     const authorized = await WalletStealthAuthorizer.fromSpec(wallet, spec, {
       crypto: new WasmStealthCrypto(this.network),
-      ...authorizerOpts,
+      ...(opts.authorizerOpts ?? {}),
     }).prepare(provider);
     const envelope = privateFee ? await this.sealWithPrivateFee(authorized, privateFee.feeSigner) : await authorized.seal();
-    const transactionId = await submitTransaction(provider, envelope);
-    return { transactionId, spec, privateFee };
+    return { envelope, spec, privateFee };
+  }
+
+  /**
+   * Dry-runs a sealed envelope (one built with `dry_run` set) against the indexer's dry-run endpoint
+   * and returns the execution result, throwing — in the same "was rejected: …" shape real
+   * submissions use — if it would be rejected. Nothing reaches consensus; nothing is spent.
+   */
+  private async dryRunEnvelope(envelope: string): Promise<ExecuteResult> {
+    const res = await fetch(`${defaultIndexerUrl(this.network)}/transactions/dry-run`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ transaction: envelope }),
+    });
+    const text = await res.text();
+    let body: { error?: { code?: string; message?: string }; result?: ExecuteResult } | undefined;
+    try {
+      body = text ? JSON.parse(text) : undefined;
+    } catch {
+      // Not JSON — reported raw below.
+    }
+    if (!res.ok || body?.error || !body?.result) {
+      throw new Error(`The dry run failed: ${body?.error?.message ?? text ?? res.statusText}`);
+    }
+    const outcome = body.result.finalize.result;
+    if (typeof outcome === "object" && outcome !== null) {
+      if ("Reject" in outcome) throw new Error(`The dry run was rejected: ${JSON.stringify(outcome.Reject)}`);
+      if ("AcceptFeeRejectRest" in outcome) {
+        throw new Error(`The dry run accepted the fee but rejected the rest: ${JSON.stringify(outcome.AcceptFeeRejectRest)}`);
+      }
+    }
+    return body.result;
   }
 
   async redeemStealthOutputWithPrivateFee(
@@ -1862,31 +2046,37 @@ export class OotleAccount implements WalletAccountApi {
    * Funds an HTLC (hashed timelock contract): creates a stealth output for `amount` of
    * `resourceAddress`, gated not by a normal one-time stealth key but by a two-leaf TIP-0006
    * condition tree (`htlcConditions` in `./htlc.ts`) — a claim path admissible only to
-   * `claimantWalletAddress` (revealing the SHA-256 preimage of `hashLockHex`, before
+   * `claimantWalletAddress` (revealing the SHA-256 preimage of `hashLockHex`, strictly before
    * `refundEpoch`), and a refund path admissible only to this account (at/after `refundEpoch`).
-   * `htlcConditions`'s own doc comment covers the exact leaf shapes.
    *
-   * This account never needs (and must never be given) the actual preimage — only its hash. The
-   * caller resolves `refundEpoch` from a desired wall-clock deadline via the provider/network's
-   * current epoch, the same as any other epoch-relative on-chain deadline.
+   * This account never needs (and must never be given) the actual preimage — only its hash.
    *
-   * Returns the full `conditions` tree alongside the transaction id and this output's own
-   * commitment: only the tree's **root** is committed on-chain, so the claimant needs the exact
-   * leaves — out of band, via whatever swap protocol coordinates the two sides — to later reveal
-   * the claim leaf.
+   * **Two lanes.** The fee and the HTLC value never share a UTXO: the fee is paid in native TARI —
+   * privately from a separate stealth TARI UTXO (`feeType: private`) or from this account's public
+   * TARI — while the main lane moves only `resourceAddress`. With `source: { kind: "stealth" }` the
+   * main lane spends this account's *own stealth outputs* of the resource (exactly the given
+   * `commitments`, or selected automatically), returning any excess as same-resource stealth change;
+   * no public balance of the resource is needed at all, so a stealth-created asset can be locked.
+   * The default `source: { kind: "revealed" }` keeps the original behavior (public balance).
    *
-   * Also returns `outputMask` (hex): this account funded the output, so it's the one place the
-   * blinding mask is ever available to it without decryption — `encrypted_data` is encrypted for
-   * `claimantWalletAddress`'s view key, not this account's, so if the claim path is never taken
-   * and this account later calls `htlcRefund`, it cannot decrypt the output the normal way (the
-   * way `htlcClaim`'s claimant can, since the output is addressed to *them*). Retaining this mask
-   * now — alongside the known `amount` — is what makes an undecryptable refund possible at all.
-   * `htlcRefund`'s own doc comment covers the rest.
+   * **Settlement safety.**
+   * - The exact transaction is dry-run first (`preflight`, default on), so a doomed fund never
+   *   reaches the network.
+   * - Before submission, the `conditions` tree, the HTLC output's own blinding `outputMask` and the
+   *   sealed envelope are written to the HTLC journal. The funder can't decrypt an output
+   *   addressed to the claimant, so the mask is the only thing that makes a refund possible —
+   *   it's never held only in memory.
+   * - With stealth change, `outputMask` is derived as `aggregateMask − changeMask` and then
+   *   *proven* before submit: a refund built from it must reproduce the HTLC output's commitment,
+   *   or the fund is aborted.
+   * - Inputs (and a private fee's UTXO) are reserved for the duration, so a concurrent operation
+   *   can't select them.
+   * - If the outcome doesn't arrive in time this throws `HtlcUnknownOutcomeError` (carrying the
+   *   refund data) instead of a plain failure; `reconcileHtlcs()` resolves it later.
    *
-   * `destination` is set to the claimant's own wallet address (not this account's) so the
-   * claimant can independently decrypt and verify the funded amount themselves, the same as any
-   * other stealth payment addressed to them — spend authority is governed entirely separately, by
-   * `payTo`.
+   * Returns the full `conditions` tree (only its root is on-chain — the claimant needs the leaves,
+   * out of band), the HTLC output's commitment (`ownCommitment`, kept for compatibility), its
+   * `outputMask`, the change commitment when there was change, and the `journalId`.
    */
   async htlcFund(
     resourceAddress: string,
@@ -1895,8 +2085,12 @@ export class OotleAccount implements WalletAccountApi {
     hashLockHex: string,
     refundEpoch: bigint,
     maxFee = 50000n,
-    feeType: FeeType = { kind: "transparent" }
-  ): Promise<{ transactionId: string; conditions: object[]; ownCommitment: string; outputMask: string }> {
+    feeType: FeeType = { kind: "transparent" },
+    options: HtlcFundOptions = {}
+  ): Promise<HtlcFundResult> {
+    if (amount <= 0n) throw new Error("htlcFund: amount must be greater than zero.");
+    const opId = newOperationId("htlc-fund");
+    const accountId = localAccountId(this.index);
     const provider = await this.getProvider();
     const account = await this.getComponentAddress();
     const walletAddress = await this.getWalletAddress();
@@ -1910,58 +2104,196 @@ export class OotleAccount implements WalletAccountApi {
       refunderPublicKeyHex: toHex(refunder.owner_key),
     });
 
-    // See shield()'s comment: the resource's own substate must be pinned explicitly -- prepare()
-    // never adds it on its own.
-    const builder = new StealthTransfer(provider, resourceAddress)
-      .withBuilder((b) => b.addInput({ substate_id: resourceAddress, version: null }))
-      .spendRevealedInput(account, amount)
-      .toStealthOutput(
-        createOutput({ destination: claimantWalletAddress, amount, resourceAddress, payTo: { Conditions: conditions } })
-      );
-    // No stealth inputs to unblind for this fund's own transfer (revealed-only source), so no
-    // viewSecret needed here even when the FEE is paid privately -- same as shield().
-    const { transactionId, spec, privateFee } = await this.prepareSignSubmit(builder, provider, account, maxFee, feeType);
-    const ownCommitment = extractOutputCommitment(spec, 0);
-    const outputMask = spec.outputMask.toHex();
+    const source = options.source ?? { kind: "revealed" as const };
+    const stealth = source.kind === "stealth";
+    const viewSecret = stealth ? await this.signer.getViewSecret() : undefined;
+    let commitments: string[] = [];
+    let change = 0n;
+    try {
+      if (stealth) {
+        ({ commitments, change } = await this.selectStealthSource(accountId, opId, resourceAddress, amount, source.commitments));
+        await reserveCommitments(accountId, commitments, opId);
+      }
 
-    const response = await withTimeout(
-      pollTransactionResult(provider, transactionId),
-      60_000,
-      "submitting the HTLC funding transaction"
-    );
-    await recordKnownVersions(response);
-    if (privateFee && feeType.kind === "private") {
-      await this.recordPrivateFeeSpend(localAccountId(this.index), feeType.feeResourceAddress, privateFee, transactionId);
+      // See shield()'s comment: the resource's own substate must be pinned explicitly -- prepare()
+      // never adds it on its own. Output 0 is the HTLC; output 1 (only with change) is ours.
+      const build = () => {
+        let b = new StealthTransfer(provider, resourceAddress).withBuilder((bb) => bb.addInput({ substate_id: resourceAddress, version: null }));
+        if (stealth) for (const c of commitments) b = b.spendStealthInput(account, fromHex(c));
+        else b = b.spendRevealedInput(account, amount);
+        // `destination` is the claimant's own wallet address so they can independently decrypt and
+        // verify the funded amount; spend authority is governed entirely by `payTo`.
+        b = b.toStealthOutput(createOutput({ destination: claimantWalletAddress, amount, resourceAddress, payTo: { Conditions: conditions } }));
+        if (change > 0n) b = b.toStealthOutput(createOutput({ destination: walletAddress, amount: change, resourceAddress }));
+        return b;
+      };
+      const sealOpts = {
+        authorizerOpts: viewSecret ? { viewSecret } : {},
+        excludeFromFeeSelection: commitments,
+        reservationHolder: opId,
+        sourceless: stealth,
+      };
+      if (options.preflight !== false) {
+        const dry = await this.sealStealthTransfer(build(), provider, account, maxFee, feeType, { ...sealOpts, dryRun: true });
+        await this.dryRunEnvelope(dry.envelope);
+      }
+      const { envelope, spec, privateFee } = await this.sealStealthTransfer(build(), provider, account, maxFee, feeType, sealOpts);
+
+      const htlcCommitment = extractOutputCommitment(spec, 0);
+      let outputMask = spec.outputMask.toHex();
+      let changeCommitment: string | undefined;
+      if (change > 0n) {
+        const outputs = (spec.statement.outputsStatement.parsed() as { outputs: unknown[] }).outputs;
+        const own = decryptOwnStatementOutput(outputs[1], viewSecret!);
+        if (own.value !== change) throw new Error(`htlcFund: change output decrypted to ${own.value}, expected ${change} — aborting before submit.`);
+        changeCommitment = own.commitment;
+        outputMask = subtractScalars(outputMask, own.maskHex);
+      }
+      // Prove the refund is buildable before anything is at stake: the mask we're about to rely on
+      // must reproduce the HTLC output's exact commitment.
+      const refundProbe = buildHtlcSpendStatement({
+        network: this.network,
+        conditions,
+        leaf: conditions[1]!,
+        data: new Uint8Array(0),
+        mask: outputMask,
+        value: amount,
+        destinationWalletAddress: walletAddress,
+        resourceAddress,
+      });
+      if (statementInputCommitment(refundProbe) !== htlcCommitment.toLowerCase()) {
+        throw new Error("htlcFund: the derived output mask does not reproduce the HTLC commitment — refusing to fund an output that couldn't be refunded.");
+      }
+
+      const now = Date.now();
+      const entry: HtlcJournalEntry = {
+        id: opId,
+        accountId,
+        kind: "fund",
+        status: "prepared",
+        resourceAddress,
+        amount: amount.toString(),
+        conditions,
+        hashLockHex: hashLockHex.toLowerCase(),
+        refundEpoch: refundEpoch.toString(),
+        htlcCommitment,
+        outputMask,
+        ownCommitment: changeCommitment,
+        ownAmount: change > 0n ? change.toString() : undefined,
+        spentCommitments: commitments.length ? commitments : undefined,
+        privateFee: journalFee(feeType, privateFee),
+        envelope,
+        createdAt: now,
+        updatedAt: now,
+      };
+      const { transactionId } = await this.submitJournaled(entry, provider, "submitting the HTLC funding transaction");
+      return { transactionId, conditions, ownCommitment: htlcCommitment, outputMask, changeCommitment, journalId: opId };
+    } catch (e) {
+      if (!(e instanceof HtlcUnknownOutcomeError)) await releaseReservations(opId);
+      throw e;
     }
-    return { transactionId, conditions, ownCommitment, outputMask };
+  }
+
+  /**
+   * Chooses the stealth inputs for a stealth-sourced HTLC fund: exactly `requested` when given
+   * (each must be this account's own unspent, unreserved record of `resourceAddress`, and must
+   * decrypt on-chain to the recorded amount), otherwise a largest-first selection covering `amount`.
+   */
+  private async selectStealthSource(
+    accountId: string,
+    holder: string,
+    resourceAddress: string,
+    amount: bigint,
+    requested?: string[]
+  ): Promise<{ commitments: string[]; change: bigint }> {
+    const unavailable = await this.unavailableCommitments(accountId, holder);
+    const records = (await listShieldedOutputs(accountId)).filter((r) => !unavailable.has(r.commitment));
+    let chosen: ShieldedOutputRecord[];
+    if (requested && requested.length > 0) {
+      const provider = await this.getProvider();
+      const crypto = new WasmStealthCrypto(this.network);
+      const viewSecret = await this.signer.getViewSecret();
+      chosen = [];
+      for (const commitment of new Set(requested.map((c) => c.toLowerCase()))) {
+        const record = records.find((r) => r.commitment.toLowerCase() === commitment);
+        if (!record) {
+          throw new Error(`htlcFund: ${commitment.slice(0, 12)}… is not one of this account's unspent, available stealth outputs (unknown, spent, or in use by another operation).`);
+        }
+        if (record.resourceAddress !== resourceAddress) throw new Error(`htlcFund: ${commitment.slice(0, 12)}… holds ${record.resourceAddress}, not ${resourceAddress}.`);
+        const substateId = stealthUtxoSubstateId(resourceAddress, fromHex(record.commitment));
+        const decrypted = await decryptOwnedUtxo(crypto, viewSecret, await provider.getSubstate(substateId), substateId);
+        if (!decrypted || decrypted.value !== BigInt(record.amount)) {
+          throw new Error(`htlcFund: ${commitment.slice(0, 12)}… is not spendable as recorded (already spent, or its on-chain value differs).`);
+        }
+        chosen.push(record);
+      }
+    } else {
+      const readable = await this.filterReadableShieldedOutputs(records, resourceAddress, amount);
+      chosen = selectShieldedUtxosForAmount(readable, resourceAddress, amount).selected;
+    }
+    const total = chosen.reduce((s, r) => s + BigInt(r.amount), 0n);
+    if (total < amount) throw new Error(`htlcFund: the selected stealth outputs hold ${total}, less than the ${amount} to lock.`);
+    return { commitments: chosen.map((r) => r.commitment), change: total - amount };
+  }
+
+  /**
+   * Checks a funded HTLC against agreed terms *without* claiming it — the verification a swap
+   * protocol runs before it reveals anything (or before it funds its own side). Returns every
+   * problem found; an empty list means the HTLC is exactly what was agreed. `htlcClaim` runs the
+   * same checks itself and refuses to reveal the preimage if any fail.
+   */
+  async verifyHtlc(
+    resourceAddress: string,
+    commitmentHex: string,
+    conditions: object[],
+    expected: HtlcExpectations = {},
+    preimageHex?: string
+  ): Promise<{ ok: boolean; problems: string[]; value: bigint | null; currentEpoch: bigint }> {
+    const provider = await this.getProvider();
+    const substateId = stealthUtxoSubstateId(resourceAddress, fromHex(commitmentHex));
+    let substate: Awaited<ReturnType<IndexerProvider["getSubstate"]>> | null = null;
+    try {
+      substate = await provider.getSubstate(substateId);
+    } catch {
+      substate = null;
+    }
+    const decrypted = substate
+      ? await decryptOwnedUtxo(new WasmStealthCrypto(this.network), await this.signer.getViewSecret(), substate, substateId)
+      : null;
+    const currentEpoch = BigInt(await provider.getCurrentEpoch());
+    const facts = {
+      value: decrypted ? decrypted.value : null,
+      onChainRoot: substate ? findScriptRoot(substate) : null,
+      conditions,
+      claimantPublicKeyHex: toHex(parseOotleAddress(await this.getWalletAddress()).owner_key),
+      currentEpoch,
+      preimageHashHex: preimageHex !== undefined ? await sha256Hex(fromHex(preimageHex)) : undefined,
+    };
+    const problems = substate
+      ? verifyHtlcTerms(facts, expected)
+      : ["The HTLC output wasn't found on-chain — it may not be funded yet, or already claimed or refunded."];
+    return { ok: problems.length === 0, problems, value: facts.value, currentEpoch };
   }
 
   /**
    * Claims a funded HTLC (the counterpart to `htlcFund`): reveals the claim leaf's SHA-256
-   * preimage to spend the script-path-locked output, moving `amount` into a brand-new, normal
-   * (freely key-spendable) stealth output owned by this account.
+   * preimage to spend the script-path-locked output into a brand-new, normal (freely
+   * key-spendable) stealth output owned by this account — which is recorded in the shielded
+   * ledger, so the claimed funds are immediately spendable/visible.
    *
-   * This account must be the intended claimant — `htlcFund` addressed the output to this
-   * account's own wallet address, so it can unblind it the normal way: fetch the `utxo_...`
-   * substate and decrypt with this account's own view secret, exactly like `claimPrivatePayment`
-   * does for any other incoming stealth payment. `conditions` must be the *exact* two-leaf tree
-   * `htlcFund` returned (or was handed out of band) — the wrong tree produces a script-path
-   * witness whose condition root won't match the output's committed `SpendAuthorization::Script`
-   * root, and `buildStealthTransferStatement`/the network both reject the spend.
+   * **Nothing is revealed until the HTLC is proven safe.** Before the preimage leaves this device
+   * it checks (see `verifyHtlc`): the output decrypts as ours; its amount (`expected.amount` /
+   * `minAmount`); the tree is a standard HTLC whose claim leaf is *our* key (and, if given, whose
+   * refund leaf is the agreed counterparty); the on-chain condition root equals the tree's root;
+   * the preimage hashes to the lock; and at least `expected.minEpochsBeforeRefund` (default 1)
+   * claim-admissible epochs remain. Any failure throws `HtlcVerificationError`.
    *
-   * Fees are paid from this account's own existing revealed balance via `pay_fee` (same as any
-   * other transaction this wallet submits), not from the claimed HTLC funds — a transaction's fee
-   * instructions execute in a separate phase *before* its main instructions, so the claim's own
-   * `StealthTransfer` instruction (a main instruction) can't fund its own fee even in principle.
-   *
-   * Bypasses `StealthTransfer`/`WalletStealthAuthorizer` entirely — that builder pipeline only
-   * ever produces key-path stealth inputs (a one-time DH signature per input), which doesn't
-   * apply here: this spend's authorization is the revealed script-path leaf itself (its
-   * `AccessRule` atom, satisfied by this account's normal transaction signature), not a stealth
-   * spend key. `buildStealthTransferStatement` (tari-project/tari-ootle#2431) produces the
-   * complete statement — inputs/outputs/balance proof/covenant claims — in one call from the
-   * unblinded mask+value and the two witnesses below, so there is nothing left for the builder
-   * pipeline to add.
+   * Then the exact claim is dry-run (`preflight`, default on) so a claim that would fail never
+   * publishes the preimage on-chain, the journal entry moves to `claim_armed`, and only then is it
+   * submitted. The fee stays in its own lane (native TARI, public or private) — the claim's main
+   * instruction never funds its own fee. Note a dry run does send the transaction (preimage
+   * included) to the indexer's dry-run endpoint; pass `preflight: false` if that indexer isn't one
+   * you trust with it.
    */
   async htlcClaim(
     resourceAddress: string,
@@ -1969,75 +2301,68 @@ export class OotleAccount implements WalletAccountApi {
     conditions: object[],
     preimageHex: string,
     maxFee = 50000n,
-    feeType: FeeType = { kind: "transparent" }
-  ): Promise<{ transactionId: string }> {
+    feeType: FeeType = { kind: "transparent" },
+    options: HtlcClaimOptions = {}
+  ): Promise<HtlcSpendResult> {
     if (!/^[0-9a-f]{64}$/i.test(preimageHex)) {
       throw new Error(`htlcClaim: preimageHex must be exactly 64 hex characters (32 bytes), got ${JSON.stringify(preimageHex)}`);
     }
-    const provider = await this.getProvider();
-    const account = await this.getComponentAddress();
-    const walletAddress = await this.getWalletAddress();
-    const commitment = fromHex(commitmentHex);
-    const substateId = stealthUtxoSubstateId(resourceAddress, commitment);
-
-    const substate = await provider.getSubstate(substateId);
-    const viewSecret = await this.signer.getViewSecret();
-    const decrypted = await decryptOwnedUtxo(new WasmStealthCrypto(this.network), viewSecret, substate, substateId);
-    if (!decrypted) {
-      throw new Error(
-        "This HTLC output doesn't belong to your account, or wasn't found on-chain — it may already be claimed or refunded."
-      );
-    }
-
     const claimLeaf = conditions[0];
     if (!claimLeaf) throw new Error("htlcClaim: conditions must be the two-leaf [claim, refund] tree htlcFund returned");
+
+    const verification = await this.verifyHtlc(resourceAddress, commitmentHex, conditions, options.expected ?? {}, preimageHex);
+    if (!verification.ok) throw new HtlcVerificationError(verification.problems);
+    const value = verification.value!;
+    const { hashLockHex, refundEpoch } = describeHtlcConditions(conditions);
+
+    const provider = await this.getProvider();
+    const substateId = stealthUtxoSubstateId(resourceAddress, fromHex(commitmentHex));
+    const decrypted = await decryptOwnedUtxo(
+      new WasmStealthCrypto(this.network),
+      await this.signer.getViewSecret(),
+      await provider.getSubstate(substateId),
+      substateId
+    );
+    if (!decrypted) throw new Error("htlcClaim: the HTLC output no longer decrypts — it may have just been claimed or refunded.");
+
+    const walletAddress = await this.getWalletAddress();
     const statementJson = buildHtlcSpendStatement({
       network: this.network,
       conditions,
       leaf: claimLeaf,
       data: fromHex(preimageHex),
       mask: decrypted.mask.toHex(),
-      value: decrypted.value,
+      value,
       destinationWalletAddress: walletAddress,
       resourceAddress,
     });
-
-    const privateFee = await this.resolvePrivateFee(feeType, maxFee);
-    const transactionId = await submitHtlcSpend({
-      provider,
-      signer: this.signer,
-      network: this.network,
-      account,
+    return this.spendHtlc({
+      kind: "claim",
       resourceAddress,
-      substateId,
+      commitmentHex,
+      conditions,
+      hashLockHex,
+      refundEpoch,
+      value,
       statementJson,
       maxFee,
-      timeoutLabel: "submitting the HTLC claim transaction",
-      privateFee,
+      feeType,
+      preflight: options.preflight !== false,
+      armedStatus: "claim_armed",
+      label: "submitting the HTLC claim transaction",
     });
-    if (privateFee && feeType.kind === "private") {
-      await this.recordPrivateFeeSpend(localAccountId(this.index), feeType.feeResourceAddress, privateFee, transactionId);
-    }
-    return { transactionId };
   }
 
   /**
-   * Refunds an HTLC this account itself funded (via `htlcFund`), once `refundEpoch` has passed:
-   * reveals the refund leaf to spend the output back into a brand-new, normal (freely
-   * key-spendable) stealth output owned by this account.
+   * Refunds an HTLC this account itself funded (via `htlcFund`), once the refund path is open:
+   * reveals the refund leaf to spend the output back into a brand-new, normal stealth output owned
+   * by this account (recorded in the shielded ledger).
    *
-   * Unlike `htlcClaim`, this account **cannot** decrypt the output on-chain — `htlcFund` addressed
-   * it to the claimant's wallet, so `encrypted_data` is encrypted for the claimant's view key, not
-   * this account's. `amount` and `outputMaskHex` must be exactly what `htlcFund` returned (or
-   * otherwise already known — this account chose `amount` itself when funding, and `outputMaskHex`
-   * is `htlcFund`'s own return value for exactly this purpose): reconstructing the commitment from
-   * a wrong mask or amount fails cleanly (the resulting input just doesn't match the on-chain
-   * commitment, so the network rejects the spend) rather than silently, but there is no recovery
-   * path if this account discarded the mask — see `htlcFund`'s doc comment.
-   *
-   * Otherwise identical to `htlcClaim`: same fee-from-own-balance reasoning, same
-   * `buildStealthTransferStatement`-in-one-call approach, same bypass of
-   * `StealthTransfer`/`WalletStealthAuthorizer`.
+   * The refund path is `AfterEpoch(refundEpoch)`, i.e. open when `currentEpoch >= refundEpoch` —
+   * checked here first, so an early refund fails with a clear message instead of an on-chain
+   * rejection. The funder can't decrypt the output (it's addressed to the claimant), so `amount` and
+   * `outputMaskHex` must be exactly what `htlcFund` returned — or use `refundFromJournal(journalId)`,
+   * which reads them back from the journal `htlcFund` wrote before submitting.
    */
   async htlcRefund(
     resourceAddress: string,
@@ -2046,16 +2371,18 @@ export class OotleAccount implements WalletAccountApi {
     amount: bigint,
     outputMaskHex: string,
     maxFee = 50000n,
-    feeType: FeeType = { kind: "transparent" }
-  ): Promise<{ transactionId: string }> {
-    const provider = await this.getProvider();
-    const account = await this.getComponentAddress();
-    const walletAddress = await this.getWalletAddress();
-    const commitment = fromHex(commitmentHex);
-    const substateId = stealthUtxoSubstateId(resourceAddress, commitment);
-
+    feeType: FeeType = { kind: "transparent" },
+    options: { preflight?: boolean } = {}
+  ): Promise<HtlcSpendResult> {
     const refundLeaf = conditions[1];
     if (!refundLeaf) throw new Error("htlcRefund: conditions must be the two-leaf [claim, refund] tree htlcFund returned");
+    const { hashLockHex, refundEpoch } = describeHtlcConditions(conditions);
+    const provider = await this.getProvider();
+    const currentEpoch = BigInt(await provider.getCurrentEpoch());
+    if (!isHtlcRefundable(currentEpoch, refundEpoch)) {
+      throw new Error(`htlcRefund: the refund path opens at epoch ${refundEpoch}; the current epoch is ${currentEpoch}.`);
+    }
+    const walletAddress = await this.getWalletAddress();
     const statementJson = buildHtlcSpendStatement({
       network: this.network,
       conditions,
@@ -2066,24 +2393,230 @@ export class OotleAccount implements WalletAccountApi {
       destinationWalletAddress: walletAddress,
       resourceAddress,
     });
-
-    const privateFee = await this.resolvePrivateFee(feeType, maxFee);
-    const transactionId = await submitHtlcSpend({
-      provider,
-      signer: this.signer,
-      network: this.network,
-      account,
+    if (statementInputCommitment(statementJson) !== commitmentHex.toLowerCase()) {
+      throw new Error("htlcRefund: this amount/mask doesn't reproduce the HTLC commitment — use the exact values htlcFund returned (or refundFromJournal).");
+    }
+    return this.spendHtlc({
+      kind: "refund",
       resourceAddress,
-      substateId,
+      commitmentHex,
+      conditions,
+      hashLockHex,
+      refundEpoch,
+      value: amount,
       statementJson,
       maxFee,
-      timeoutLabel: "submitting the HTLC refund transaction",
-      privateFee,
+      feeType,
+      preflight: options.preflight !== false,
+      armedStatus: "prepared",
+      label: "submitting the HTLC refund transaction",
     });
-    if (privateFee && feeType.kind === "private") {
-      await this.recordPrivateFeeSpend(localAccountId(this.index), feeType.feeResourceAddress, privateFee, transactionId);
+  }
+
+  /** Refunds an HTLC this account funded, using the conditions/mask/amount `htlcFund` journaled. */
+  async refundFromJournal(journalId: string, maxFee = 50000n, feeType: FeeType = { kind: "transparent" }): Promise<HtlcSpendResult> {
+    const entry = await getHtlcJournalEntry(journalId);
+    if (!entry || entry.kind !== "fund" || entry.accountId !== localAccountId(this.index)) {
+      throw new Error(`refundFromJournal: ${journalId} is not an HTLC this account funded.`);
     }
-    return { transactionId };
+    if (!entry.htlcCommitment || !entry.outputMask) throw new Error(`refundFromJournal: ${journalId} has no HTLC commitment/mask recorded.`);
+    return this.htlcRefund(entry.resourceAddress, entry.htlcCommitment, entry.conditions, BigInt(entry.amount), entry.outputMask, maxFee, feeType);
+  }
+
+  /** Shared claim/refund path: private-fee reservation, dry run, journal, submit, bookkeeping. */
+  private async spendHtlc(p: {
+    kind: "claim" | "refund";
+    resourceAddress: string;
+    commitmentHex: string;
+    conditions: object[];
+    hashLockHex: string;
+    refundEpoch: bigint;
+    value: bigint;
+    statementJson: string;
+    maxFee: bigint;
+    feeType: FeeType;
+    preflight: boolean;
+    armedStatus: "claim_armed" | "prepared";
+    label: string;
+  }): Promise<HtlcSpendResult> {
+    const opId = newOperationId(`htlc-${p.kind}`);
+    const accountId = localAccountId(this.index);
+    const provider = await this.getProvider();
+    const account = await this.getComponentAddress();
+    const substateId = stealthUtxoSubstateId(p.resourceAddress, fromHex(p.commitmentHex));
+    const ownCommitment = statementOutputCommitment(p.statementJson, 0);
+    try {
+      const privateFee = await this.resolvePrivateFee(p.feeType, p.maxFee, [], opId);
+      const envelopeFor = (dryRun: boolean) =>
+        buildHtlcSpendEnvelope({
+          provider,
+          signer: this.signer,
+          network: this.network,
+          account,
+          resourceAddress: p.resourceAddress,
+          substateId,
+          statementJson: p.statementJson,
+          maxFee: p.maxFee,
+          privateFee,
+          dryRun,
+        });
+      if (p.preflight) await this.dryRunEnvelope(await envelopeFor(true));
+      const envelope = await envelopeFor(false);
+      const now = Date.now();
+      const entry: HtlcJournalEntry = {
+        id: opId,
+        accountId,
+        kind: p.kind,
+        status: p.armedStatus,
+        resourceAddress: p.resourceAddress,
+        amount: p.value.toString(),
+        conditions: p.conditions,
+        hashLockHex: p.hashLockHex,
+        refundEpoch: p.refundEpoch.toString(),
+        htlcCommitment: p.commitmentHex.toLowerCase(),
+        ownCommitment,
+        ownAmount: p.value.toString(),
+        privateFee: journalFee(p.feeType, privateFee),
+        envelope,
+        createdAt: now,
+        updatedAt: now,
+      };
+      const { transactionId } = await this.submitJournaled(entry, provider, p.label);
+      return { transactionId, receivedCommitment: ownCommitment, amount: p.value, journalId: opId };
+    } catch (e) {
+      if (!(e instanceof HtlcUnknownOutcomeError)) await releaseReservations(opId);
+      throw e;
+    }
+  }
+
+  /**
+   * Journal → submit → poll → bookkeeping, for every HTLC operation. The entry (with its sealed
+   * envelope and recovery data) is persisted before submission; a definitive rejection marks it
+   * `failed`, anything ambiguous marks it `unknown` and throws `HtlcUnknownOutcomeError`.
+   */
+  private async submitJournaled(entry: HtlcJournalEntry, provider: IndexerProvider, label: string): Promise<{ transactionId: string }> {
+    await putHtlcJournalEntry(entry);
+    let transactionId: string | undefined;
+    try {
+      transactionId = await submitTransaction(provider, entry.envelope);
+      await updateHtlcJournalEntry(entry.id, { status: "submitted", transactionId });
+      const response = await withTimeout(pollTransactionResult(provider, transactionId), 60_000, label);
+      await this.finalizeHtlcEntry({ ...entry, transactionId }, response);
+      return { transactionId };
+    } catch (e) {
+      const error = e instanceof Error ? e.message : String(e);
+      if (isDefinitiveRejection(e)) {
+        await updateHtlcJournalEntry(entry.id, { status: "failed", error, transactionId });
+        await releaseReservations(entry.id);
+        throw e;
+      }
+      await updateHtlcJournalEntry(entry.id, { status: "unknown", error, transactionId });
+      throw new HtlcUnknownOutcomeError(
+        entry.id,
+        { kind: entry.kind, transactionId, conditions: entry.conditions, htlcCommitment: entry.htlcCommitment, outputMask: entry.outputMask },
+        e
+      );
+    }
+  }
+
+  /** Applies a confirmed HTLC operation's local bookkeeping. Idempotent (see `addShieldedOutput`). */
+  private async finalizeHtlcEntry(entry: HtlcJournalEntry, response: IndexerGetTransactionResultResponse): Promise<void> {
+    const txId = entry.transactionId!;
+    await recordKnownVersions(response);
+    if (entry.ownCommitment && entry.ownAmount) {
+      await recordKnownShieldedOutput(entry.accountId, entry.resourceAddress, entry.ownCommitment, BigInt(entry.ownAmount), txId);
+    }
+    for (const c of entry.spentCommitments ?? []) await markShieldedOutputSpent(entry.accountId, c);
+    if (entry.privateFee) {
+      await recordKnownShieldedOutput(entry.accountId, entry.privateFee.feeResourceAddress, entry.privateFee.changeCommitment, BigInt(entry.privateFee.changeAmount), txId);
+      await markShieldedOutputSpent(entry.accountId, entry.privateFee.spentCommitment);
+    }
+    await updateHtlcJournalEntry(entry.id, { status: "confirmed", transactionId: txId, error: undefined });
+    await releaseReservations(entry.id);
+  }
+
+  /** This account's HTLC journal (every fund/claim/refund and its state), newest first. The
+   * entries' `envelope` of a claim contains the preimage — don't display or export it. */
+  async listHtlcs(): Promise<HtlcJournalEntry[]> {
+    return (await listHtlcJournal(localAccountId(this.index))).sort((a, b) => b.createdAt - a.createdAt);
+  }
+
+  /**
+   * Resolves every HTLC operation whose outcome isn't final (`prepared`, `claim_armed`,
+   * `submitted`, `unknown`) — call at startup and after any `HtlcUnknownOutcomeError`. An entry
+   * with no transaction id is resubmitted with its *identical* sealed envelope (the same
+   * transaction, so it can't execute twice; an expired one is simply rejected); then its result is
+   * checked once. Confirmed entries get their bookkeeping applied, rejected ones are marked
+   * `failed` and release their reserved UTXOs, still-pending ones are left for the next call.
+   */
+  async reconcileHtlcs(): Promise<HtlcJournalEntry[]> {
+    const provider = await this.getProvider();
+    const open = (await listHtlcJournal(localAccountId(this.index))).filter((e) =>
+      ["prepared", "claim_armed", "submitted", "unknown"].includes(e.status)
+    );
+    const out: HtlcJournalEntry[] = [];
+    for (const entry of open) {
+      let current: HtlcJournalEntry = entry;
+      try {
+        let txId = entry.transactionId;
+        if (!txId) {
+          try {
+            txId = await submitTransaction(provider, entry.envelope);
+            current = (await updateHtlcJournalEntry(entry.id, { status: "submitted", transactionId: txId })) ?? current;
+          } catch (e) {
+            const error = e instanceof Error ? e.message : String(e);
+            if (isDefinitiveRejection(e) || /HTTP 4\d\d/.test(error)) {
+              current = (await updateHtlcJournalEntry(entry.id, { status: "failed", error })) ?? current;
+              await releaseReservations(entry.id);
+            } else {
+              current = (await updateHtlcJournalEntry(entry.id, { status: "unknown", error })) ?? current;
+            }
+            out.push(current);
+            continue;
+          }
+        }
+        const response = await provider.getTransactionResult(txId);
+        const result = response.result;
+        if (result === "Pending") {
+          out.push(current);
+          continue;
+        }
+        if ("Rejected" in result) {
+          current = (await updateHtlcJournalEntry(entry.id, { status: "failed", error: result.Rejected.details })) ?? current;
+          await releaseReservations(entry.id);
+          out.push(current);
+          continue;
+        }
+        const outcome = result.Finalized.execution_result?.finalize.result;
+        if (outcome && typeof outcome === "object" && "Accept" in outcome) {
+          await this.finalizeHtlcEntry({ ...entry, transactionId: txId }, response);
+          current = (await getHtlcJournalEntry(entry.id)) ?? current;
+        } else {
+          current = (await updateHtlcJournalEntry(entry.id, { status: "failed", error: JSON.stringify(outcome ?? null) })) ?? current;
+          await releaseReservations(entry.id);
+        }
+      } catch (e) {
+        // A transient error on one entry must not block the rest; it stays open for next time.
+        current = (await updateHtlcJournalEntry(entry.id, { error: e instanceof Error ? e.message : String(e) })) ?? current;
+      }
+      out.push(current);
+    }
+    return out;
+  }
+
+  /**
+   * Stealth commitments this account must not select right now: reserved by another in-flight
+   * operation, or spent (as an input or a private fee) by an HTLC operation whose outcome isn't
+   * final — those may already be gone on-chain even after their reservation lapses.
+   */
+  private async unavailableCommitments(accountId: string, holder?: string): Promise<Set<string>> {
+    const out = await listReservedCommitments(accountId, holder);
+    for (const e of await listHtlcJournal(accountId)) {
+      if (e.id === holder || !["prepared", "claim_armed", "submitted", "unknown"].includes(e.status)) continue;
+      for (const c of e.spentCommitments ?? []) out.add(c);
+      if (e.privateFee) out.add(e.privateFee.spentCommitment);
+    }
+    return out;
   }
 
   /**
@@ -2124,80 +2657,92 @@ export class OotleAccount implements WalletAccountApi {
   ): Promise<{ transactionId: string; recipientCommitment: string; recipientSubstateId: string; minimumValuePromise: string }> {
     assertValidMinimumValuePromise(minimumValuePromise, amount);
     const accountId = localAccountId(this.index);
-    const records = await this.filterReadableShieldedOutputs(await listShieldedOutputs(accountId), resourceAddress, amount);
-    const { commitments, changeAmount } = resolveSendPrivatelyPlan(records, resourceAddress, amount);
-    const dust = 1n;
-
-    const provider = await this.getProvider();
-    const account = await this.getComponentAddress();
-    const ownWalletAddress = await this.getWalletAddress();
-
-    // See shield()'s comment: the resource's own substate must be pinned explicitly -- prepare()
-    // never adds it on its own.
-    let builder = new StealthTransfer(provider, resourceAddress)
-      .withBuilder((b) => b.addInput({ substate_id: resourceAddress, version: null }))
-      .spendRevealedInput(account, dust);
-    for (const commitment of commitments) {
-      builder = builder.spendStealthInput(account, fromHex(commitment));
-    }
-    // The promise rides on the recipient's output only. Putting one on the change output would
-    // publish a floor on this account's own remaining private balance -- an unrelated disclosure the
-    // caller never asked for, and one the recipient has no interest in.
-    builder = builder.toStealthOutput(
-      createOutput({ destination: recipientWalletAddress, amount, resourceAddress, memo: toMemo(memo), minimumValuePromise }),
-    );
-    if (changeAmount > 0n) {
-      builder = builder.toStealthOutput(createOutput({ destination: ownWalletAddress, amount: changeAmount, resourceAddress }));
-    }
-    builder = builder.toRevealedOutput(dust);
-
-    const viewSecret = await this.signer.getViewSecret();
-    // `commitments` excluded from the fee UTXO's own selection -- see unshield()'s identical
-    // comment on why (this and unshield are the only two methods with their own multi-UTXO
-    // coin selection of potentially the same resource as the fee).
-    const { transactionId, spec, privateFee } = await this.prepareSignSubmit(
-      builder,
-      provider,
-      account,
-      maxFee,
-      feeType,
-      { viewSecret },
-      commitments
-    );
-    // Output 0 is the recipient's; output 1 (only present when there's change) is ours. The
-    // recipient has no way to discover their new output on their own (no scan-by-view-key API
-    // exists) -- this commitment must be handed back to the caller so it can be shared with them
-    // out of band; without it, the payment is invisible to them even though it succeeded on-chain.
-    const recipientCommitment = extractOutputCommitment(spec, 0);
-    const ownCommitment = changeAmount > 0n ? extractOutputCommitment(spec, 1) : undefined;
-
-    await addPendingShield({
-      transactionId,
-      accountId,
+    const opId = newOperationId("send-private");
+    const unavailable = await this.unavailableCommitments(accountId, opId);
+    const records = await this.filterReadableShieldedOutputs(
+      (await listShieldedOutputs(accountId)).filter((r) => !unavailable.has(r.commitment)),
       resourceAddress,
-      amount: changeAmount.toString(),
-      spentCommitments: commitments,
-      ownCommitment,
-    });
+      amount
+    );
+    const { commitments, changeAmount } = resolveSendPrivatelyPlan(records, resourceAddress, amount);
+    await reserveCommitments(accountId, commitments, opId);
     try {
-      const response = await withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the private send");
-      await recordKnownVersions(response);
-      if (ownCommitment) await recordKnownShieldedOutput(accountId, resourceAddress, ownCommitment, changeAmount, transactionId);
+      const dust = 1n;
+
+      const provider = await this.getProvider();
+      const account = await this.getComponentAddress();
+      const ownWalletAddress = await this.getWalletAddress();
+
+      // See shield()'s comment: the resource's own substate must be pinned explicitly -- prepare()
+      // never adds it on its own.
+      let builder = new StealthTransfer(provider, resourceAddress)
+        .withBuilder((b) => b.addInput({ substate_id: resourceAddress, version: null }))
+        .spendRevealedInput(account, dust);
       for (const commitment of commitments) {
-        await markShieldedOutputSpent(accountId, commitment);
+        builder = builder.spendStealthInput(account, fromHex(commitment));
       }
-      if (privateFee && feeType.kind === "private") {
-        await this.recordPrivateFeeSpend(accountId, feeType.feeResourceAddress, privateFee, transactionId);
+      // The promise rides on the recipient's output only. Putting one on the change output would
+      // publish a floor on this account's own remaining private balance -- an unrelated disclosure the
+      // caller never asked for, and one the recipient has no interest in.
+      builder = builder.toStealthOutput(
+        createOutput({ destination: recipientWalletAddress, amount, resourceAddress, memo: toMemo(memo), minimumValuePromise }),
+      );
+      if (changeAmount > 0n) {
+        builder = builder.toStealthOutput(createOutput({ destination: ownWalletAddress, amount: changeAmount, resourceAddress }));
       }
+      builder = builder.toRevealedOutput(dust);
+
+      const viewSecret = await this.signer.getViewSecret();
+      // `commitments` excluded from the fee UTXO's own selection -- see unshield()'s identical
+      // comment on why (this and unshield are the only two methods with their own multi-UTXO
+      // coin selection of potentially the same resource as the fee).
+      const { transactionId, spec, privateFee } = await this.prepareSignSubmit(
+        builder,
+        provider,
+        account,
+        maxFee,
+        feeType,
+        { viewSecret },
+        commitments,
+        opId
+      );
+      // Output 0 is the recipient's; output 1 (only present when there's change) is ours. The
+      // recipient has no way to discover their new output on their own (no scan-by-view-key API
+      // exists) -- this commitment must be handed back to the caller so it can be shared with them
+      // out of band; without it, the payment is invisible to them even though it succeeded on-chain.
+      const recipientCommitment = extractOutputCommitment(spec, 0);
+      const ownCommitment = changeAmount > 0n ? extractOutputCommitment(spec, 1) : undefined;
+
+      await addPendingShield({
+        transactionId,
+        accountId,
+        resourceAddress,
+        amount: changeAmount.toString(),
+        spentCommitments: commitments,
+        ownCommitment,
+      });
+      try {
+        const response = await withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the private send");
+        await recordKnownVersions(response);
+        if (ownCommitment) await recordKnownShieldedOutput(accountId, resourceAddress, ownCommitment, changeAmount, transactionId);
+        for (const commitment of commitments) {
+          await markShieldedOutputSpent(accountId, commitment);
+        }
+        if (privateFee && feeType.kind === "private") {
+          await this.recordPrivateFeeSpend(accountId, feeType.feeResourceAddress, privateFee, transactionId);
+        }
+      } finally {
+        await removePendingShield(transactionId);
+      }
+      return {
+        transactionId,
+        recipientCommitment,
+        recipientSubstateId: stealthUtxoSubstateId(resourceAddress, fromHex(recipientCommitment)),
+        minimumValuePromise: minimumValuePromise.toString(),
+      };
     } finally {
-      await removePendingShield(transactionId);
+      await releaseReservations(opId);
     }
-    return {
-      transactionId,
-      recipientCommitment,
-      recipientSubstateId: stealthUtxoSubstateId(resourceAddress, fromHex(recipientCommitment)),
-      minimumValuePromise: minimumValuePromise.toString(),
-    };
   }
 
   /**
@@ -2679,17 +3224,17 @@ export function buildHtlcSpendStatement(params: {
 }
 
 /**
- * Submits a hand-built HTLC claim/refund transaction: one `StealthTransfer` instruction carrying
- * `statementJson` verbatim, spending `substateId`, fee paid from `account`'s own revealed balance.
+ * Builds and seals (but does not submit) a hand-built HTLC claim/refund transaction: one
+ * `StealthTransfer` instruction carrying `statementJson` verbatim, spending `substateId`, with the fee
+ * in its own lane -- native TARI from `account`'s public balance, or a private fee UTXO.
  *
- * Deliberately bypasses `TransactionBuilder`'s usual `WalletStealthAuthorizer` companion — that
- * pipeline only ever produces key-path stealth-input signatures, which don't apply to a
- * script-path spend (whose authorization is the revealed leaf's own `AccessRule`, satisfied by
- * this account's ordinary transaction signature) — `signTransaction`/`sealTransaction` alone are
- * both necessary and sufficient here, the same pipeline any plain `CallMethod`-only transaction
- * uses.
+ * Deliberately bypasses `TransactionBuilder`'s usual `WalletStealthAuthorizer` companion -- that
+ * pipeline only ever produces key-path stealth-input signatures, which don't apply to a script-path
+ * spend (whose authorization is the revealed leaf's own `AccessRule`, satisfied by this account's
+ * ordinary transaction signature) -- `signTransaction`/`sealTransaction` alone are both necessary and
+ * sufficient here. `dryRun` marks the transaction before it's signed, for `dryRunEnvelope`.
  */
-async function submitHtlcSpend(params: {
+async function buildHtlcSpendEnvelope(params: {
   provider: IndexerProvider;
   signer: SecretKeyWallet;
   network: Network;
@@ -2698,10 +3243,9 @@ async function submitHtlcSpend(params: {
   substateId: string;
   statementJson: string;
   maxFee: bigint;
-  timeoutLabel: string;
-  /** Resolved by the caller via `OotleAccount.resolvePrivateFee` (a plain function can't call
-   * that private instance method itself) -- `null` for a transparent fee, unchanged behavior. */
+  /** Resolved by the caller via `OotleAccount.resolvePrivateFee` -- `null` for a transparent fee. */
   privateFee: PrivateFeeMaterial | null;
+  dryRun: boolean;
 }): Promise<string> {
   const maxEpoch = await resolveMaxEpoch(params.provider);
   const builder = TransactionBuilder.new(params.network, maxEpoch)
@@ -2728,14 +3272,12 @@ async function submitHtlcSpend(params: {
   for (const vaultId of await getVaultIdsForAccount(params.provider, params.account)) {
     builder.addInput({ substate_id: vaultId, version: null });
   }
-  const unsignedTx = await resolveTransaction(params.provider, builder.buildUnsignedTransaction());
+  const unsigned = builder.buildUnsignedTransaction();
+  unsigned.dry_run = params.dryRun;
+  const unsignedTx = await resolveTransaction(params.provider, unsigned);
   const extraSigners = params.privateFee ? [params.privateFee.feeSigner] : [];
   const signed = await signTransaction([params.signer, ...extraSigners], unsignedTx);
-  const envelope = await sealTransaction(signed);
-  const transactionId = await submitTransaction(params.provider, envelope);
-  const response = await withTimeout(pollTransactionResult(params.provider, transactionId), 60_000, params.timeoutLabel);
-  await recordKnownVersions(response);
-  return transactionId;
+  return sealTransaction(signed);
 }
 
 function extractOutputCommitment(spec: StealthTransferSpec, outputIndex: number): string {
