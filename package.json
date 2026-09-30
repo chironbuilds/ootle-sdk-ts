@@ -1,6 +1,6 @@
 {
   "name": "@chironbuilder/ootle-sdk",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "description": "Shared TypeScript client for Tari Ootle (L2): account derivation, balances, transactions, HTLCs, and stealth/confidential transfers — the account core behind Sapient and the Tari L1 web wallet's Ootle support.",
   "type": "module",
   "license": "MIT",
@@ -44,12 +44,16 @@
     "@tari-project/ootle": "file:./vendor/ootle-patched",
     "@tari-project/ootle-indexer": "^0.3.0",
     "@tari-project/ootle-secret-key-wallet": "^0.3.0",
-    "@tari-project/ootle-ts-bindings": "^1.49.1",
+    "@tari-project/ootle-ts-bindings": "^1.55.0",
     "@tari-project/ootle-wasm": "file:./vendor/ootle-wasm-patched"
   },
   "devDependencies": {
     "@types/chrome": "^0.0.280",
     "typescript": "^5.6.0",
     "vitest": "^4.1.0"
+  },
+  "overrides": {
+    "@tari-project/ootle-wasm": "$@tari-project/ootle-wasm",
+    "@tari-project/ootle": "$@tari-project/ootle"
   }
 }

@@ -17,7 +17,7 @@
     }
   },
   "dependencies": {
-    "@tari-project/ootle-ts-bindings": "^1.49.1",
-    "@tari-project/ootle-wasm": "^0.41.0"
+    "@tari-project/ootle-ts-bindings": "^1.55.0",
+    "@tari-project/ootle-wasm": "^0.42.0"
   }
 }

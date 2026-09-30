@@ -219,7 +219,7 @@ export function buildStealthInputsStatementFromInputs(inputs_json: string, revea
  * ... }` shape `createStealthOutputWitness` returns -- collect one entry per output (including
  * change).
  */
-export function buildStealthTransferStatement(input_witnesses_json: string, revealed_input_amount_microtari: bigint, output_witnesses_json: string, revealed_output_amount_microtari: bigint): string;
+export function buildStealthTransferStatement(input_witnesses_json: string, revealed_input_amount_microtari: bigint, output_witnesses_json: string, revealed_output_amount_microtari: bigint, revealed_receiver: Uint8Array): string;
 
 /**
  * Derive the stealth claim secret `s = H(p·R) + p` for claiming an L1 (minotari) burn, from the
@@ -348,7 +348,7 @@ export function generateOotleSecretKey(): OotleSecretKey;
  * commitment masks respectively. Returns a `(public_nonce, signature)` pair (each 32 bytes); the pair
  * may be all-zeros for revealed-only transfers — callers normally omit the balance proof in that case.
  */
-export function generateStealthBalanceProofSignature(aggregated_input_mask: Uint8Array, aggregated_output_mask: Uint8Array, inputs_statement_json: string, outputs_statement_json: string): SchnorrSignatureResult;
+export function generateStealthBalanceProofSignature(aggregated_input_mask: Uint8Array, aggregated_output_mask: Uint8Array, inputs_statement_json: string, outputs_statement_json: string, covenant_claims_json: string): SchnorrSignatureResult;
 
 /**
  * Generate the output side of a stealth transfer: per-output Pedersen commitments and encrypted data,
@@ -374,7 +374,7 @@ export function generateStealthBalanceProofSignature(aggregated_input_mask: Uint
  * Returns the serialized statement plus the aggregated output mask, which the sender feeds to
  * `generateStealthBalanceProofSignature` together with the aggregated input mask.
  */
-export function generateStealthOutputsStatement(witnesses_json: string, revealed_output_amount_microtari: bigint): StealthOutputsResult;
+export function generateStealthOutputsStatement(witnesses_json: string, revealed_output_amount_microtari: bigint, revealed_receiver: Uint8Array): StealthOutputsResult;
 
 /**
  * Hash an UnsignedTransactionV1 (JSON string) for signing.
@@ -447,7 +447,7 @@ export function unblindOutput(output_commitment: Uint8Array, encrypted_data: Uin
  * output statements. Returns `false` on a malformed proof or invalid signature; the engine performs
  * the authoritative check at submission.
  */
-export function validateBalanceProofSignature(public_nonce: Uint8Array, signature: Uint8Array, inputs_statement_json: string, outputs_statement_json: string): boolean;
+export function validateBalanceProofSignature(public_nonce: Uint8Array, signature: Uint8Array, inputs_statement_json: string, outputs_statement_json: string, covenant_claims_json: string): boolean;
 
 /**
  * Check an L1 burn's ownership proof against the stealth claim key derived from `stealth_secret`,

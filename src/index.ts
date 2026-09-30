@@ -10,8 +10,8 @@ export {
   deriveComponentAddress,
 } from "./componentAddress.js";
 
-export type { BurnClaimProofContents, KernelMerkleProof, L1BurnProofParts } from "./burnClaim.js";
-export { assembleBurnClaimProof, parseConsoleWalletBurnProof } from "./burnClaim.js";
+export type { BurnClaimProofContents, BurnOutputProof, L1BurnProofParts, L1MmrInclusionProof } from "./burnClaim.js";
+export { assembleBurnClaimProof, claimProofFromL1, decodeBurnOutputFeatures, parseConsoleWalletBurnProof } from "./burnClaim.js";
 
 export type { ConfidentialSumResult, ScannedStealthOutput } from "./confidential.js";
 export { scanTransactionsForOwnedOutputs, sumConfidentialCommitments } from "./confidential.js";

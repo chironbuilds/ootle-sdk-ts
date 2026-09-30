@@ -71,7 +71,7 @@ describe("per-output HTLC mask from a two-output fund (real wasm crypto)", () =>
     const amount = 70_000n;
     const htlcWitness = createStealthOutputWitness(NETWORK, f.claimant.public_key, f.claimant.public_key, amount, RESOURCE, null, null, JSON.stringify({ Conditions: f.conditions }), 0n);
     const changeWitness = createStealthOutputWitness(NETWORK, f.funder.public_key, f.funder.public_key, 30_000n, RESOURCE, null, null, null, 0n);
-    const result = generateStealthOutputsStatement(`[${htlcWitness},${changeWitness}]`, 0n);
+    const result = generateStealthOutputsStatement(`[${htlcWitness},${changeWitness}]`, 0n, new Uint8Array(0));
     const aggregate = toHex(result.aggregated_output_mask);
     const htlcMask = findKey(JSON.parse(htlcWitness), "mask")!;
     const changeMask = findKey(JSON.parse(changeWitness), "mask")!;
@@ -103,7 +103,7 @@ describe("per-output HTLC mask from a two-output fund (real wasm crypto)", () =>
     const amount = 70_000n;
     const htlcWitness = createStealthOutputWitness(NETWORK, f.claimant.public_key, f.claimant.public_key, amount, RESOURCE, null, null, JSON.stringify({ Conditions: f.conditions }), 0n);
     const changeWitness = createStealthOutputWitness(NETWORK, f.funder.public_key, f.funder.public_key, 30_000n, RESOURCE, null, null, null, 0n);
-    const result = generateStealthOutputsStatement(`[${htlcWitness},${changeWitness}]`, 0n);
+    const result = generateStealthOutputsStatement(`[${htlcWitness},${changeWitness}]`, 0n, new Uint8Array(0));
     const outputs = (JSON.parse(result.statement_json) as { outputs: unknown[] }).outputs;
     // Our change (index 1) decrypts with our view secret…
     const change = decryptOwnStatementOutput(outputs[1], f.funder.secret_key);
