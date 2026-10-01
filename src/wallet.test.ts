@@ -12,6 +12,7 @@ import {
   resolveUnshieldPlan,
   selectPrivateFeeUtxo,
   isSpentElsewhere,
+  transactionOutcome,
   selectShieldedUtxosForAmount,
   selectUnspentShieldedOutputs,
   substateExists,
@@ -587,5 +588,18 @@ describe("isSpentElsewhere", () => {
   it("never counts a server or network error", () => {
     expect(isSpentElsewhere(old, new Error("HTTP 500: internal error"), now)).toBe(false);
     expect(isSpentElsewhere(old, new TypeError("Failed to fetch"), now)).toBe(false);
+  });
+});
+
+describe("transactionOutcome", () => {
+  it("reads a committed entry", () => {
+    expect(transactionOutcome({ rejected_reason: null, summary: { outcome: "Commit" } })).toBe("committed");
+  });
+  it("treats a rejected or aborted entry as failed", () => {
+    expect(transactionOutcome({ rejected_reason: "Insufficient fees paid", summary: null })).toBe("failed");
+    expect(transactionOutcome({ rejected_reason: null, summary: { outcome: { Abort: "x" } } })).toBe("failed");
+  });
+  it("treats an entry with no outcome yet as pending", () => {
+    expect(transactionOutcome({ rejected_reason: null, summary: null })).toBe("pending");
   });
 });

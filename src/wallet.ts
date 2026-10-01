@@ -1852,14 +1852,19 @@ export class OotleAccount implements WalletAccountApi {
     opId: string
   ): Promise<{ transactionId: string; recipientCommitment: string; recipientSubstateId: string; minimumValuePromise: string }> {
     const accountId = localAccountId(this.index);
-    // The caller checked readability up to `amount` only; the fee needs more, and a stale record
-    // (spent from another device) must not be picked for it.
     records = await this.filterReadableShieldedOutputs(records, resourceAddress, amount + maxFee);
+    // Enough inputs for the amount plus the fee limit when the balance allows; otherwise all of
+    // them -- the measured fee is usually far below the limit, and `build` checks the real one.
     let commitments: string[];
     try {
       ({ commitments } = resolveSendPrivatelyPlan(records, resourceAddress, amount + maxFee));
     } catch {
-      throw new Error(`Not enough private balance to send ${amount} and pay its private fee (up to ${maxFee}) from it.`);
+      const all = records.filter((r) => r.resourceAddress === resourceAddress && !r.spent);
+      const total = all.reduce((sum, r) => sum + BigInt(r.amount), 0n);
+      if (total <= amount) {
+        throw new Error(`Not enough private balance to send ${amount} and pay its fee from it (you have ${total}).`);
+      }
+      commitments = all.map((r) => r.commitment);
     }
     await reserveCommitments(accountId, commitments, opId);
     try {
@@ -1937,7 +1942,13 @@ export class OotleAccount implements WalletAccountApi {
         };
       };
 
-      const fee = await this.estimateClaimFee(await build(maxFee, true), "private send");
+      // The dry run must have the real transaction's shape, change output included, or it meters
+      // a cheaper transaction than the one sent: so its probe fee always leaves at least 1 unit of
+      // change. Any such fee works -- it only feeds the metered cost.
+      const roomForChange = total - amount - 1n;
+      const probe = roomForChange < maxFee ? roomForChange : maxFee;
+      if (probe <= 0n) throw new Error(`Not enough private balance to send ${amount} and pay its fee from it (you have ${total}).`);
+      const fee = await this.estimateClaimFee(await build(probe, true), "private send");
       if (fee > maxFee) throw new Error(`sendPrivately: the private fee would be ${fee}, above the ${maxFee} limit`);
       const attempt = await build(fee, false);
       const transactionId = await submitTransaction(provider, attempt.envelope);
@@ -2863,9 +2874,16 @@ export class OotleAccount implements WalletAccountApi {
     // An account that has only ever held private funds (e.g. a claimed L1 burn) has no component
     // on-chain to take the dust or a public fee from, so its send pays the fee from itself, like
     // unshield's new-account path.
-    if (!(await substateExists(await this.getProvider(), await this.getComponentAddress()))) {
+    // An account that exists but holds too little public TARI for the dust and a transparent fee is
+    // in the same position.
+    const noPublicFunds = async () => {
+      if (feeType.kind === "private") return false;
+      const tari = (await this.getBalances().catch(() => [])).find((b) => b.resourceAddress === TARI_RESOURCE_ADDRESS);
+      return (tari?.amount ?? 0n) < maxFee + 1n;
+    };
+    if (!(await substateExists(await this.getProvider(), await this.getComponentAddress())) || (await noPublicFunds())) {
       if (resourceAddress !== TARI_RESOURCE_ADDRESS) {
-        throw new Error("This account doesn't exist on-chain yet, so it can only send TARI privately until it is created (unshield some TARI first).");
+        throw new Error("This account has no public TARI to pay fees with, so it can only send TARI privately (the fee comes from the send). Unshield some TARI first to send other tokens.");
       }
       return this.sendPrivatelyPayingFeeFromTransfer(records, resourceAddress, recipientWalletAddress, amount, maxFee, memo, minimumValuePromise, opId);
     }
@@ -3375,6 +3393,7 @@ export class OotleAccount implements WalletAccountApi {
     const isFirstScan = previousCursor === null;
     const pageBudget = maxPages ?? (isFirstScan ? 400 : 3);
     let reachedCursor = false;
+    let pendingSeen = false;
 
     pages: for (let page = 0; page < pageBudget; page++) {
       const { transactions } = await provider.listRecentTransactions({ limit: pageSize, last_id: lastId, source: null });
@@ -3389,6 +3408,12 @@ export class OotleAccount implements WalletAccountApi {
           reachedCursor = true;
           break pages;
         }
+        // Only a committed transaction's outputs exist. A rejected or aborted one (its body still
+        // lists them) would otherwise be recorded as money that isn't there; one not finalized yet
+        // is looked at again next time, so the cursor must not move past it.
+        const outcome = transactionOutcome(entry);
+        if (outcome === "pending") pendingSeen = true;
+        if (outcome !== "committed") continue;
         const newlyFound = await scanTransactionsForOwnedOutputs(crypto, viewSecret, [entry], knownCommitments);
         for (const raw of newlyFound) {
           // scanTransactionsForOwnedOutputs' `memo` is the raw JSON-encoded Memo union (see
@@ -3396,15 +3421,23 @@ export class OotleAccount implements WalletAccountApi {
           // and this method's own return value carry plain text, not JSON, memo consumers never
           // need to know about `fromMemo()` themselves.
           const output = { ...raw, memo: fromMemo(raw.memo) };
+          // The scan walks history, so an output it finds may have been spent since (from this or
+          // another device). Its transaction committed, so "not found" now can only mean spent:
+          // remembered as spent rather than counted, and not reported as a new payment.
+          const spentAlready = await utxoGone(provider, output.resourceAddress, output.commitment);
           await recordKnownShieldedOutput(accountId, output.resourceAddress, output.commitment, output.amount, output.transactionId, output.memo);
           knownCommitments.add(output.commitment);
+          if (spentAlready) {
+            await markShieldedOutputSpent(accountId, output.commitment);
+            continue;
+          }
           found.push(output);
         }
       }
       lastId = transactions[transactions.length - 1]!.transaction_id;
     }
 
-    if (newestSeen && reachedCursor) await setPrivatePaymentScanCursor(accountId, newestSeen);
+    if (newestSeen && reachedCursor && !pendingSeen) await setPrivatePaymentScanCursor(accountId, newestSeen);
     return { claimed: found.length, found };
   }
 
@@ -3764,6 +3797,25 @@ const SPENT_ELSEWHERE_GRACE_MS = 10 * 60_000;
 export function isSpentElsewhere(record: Pick<ShieldedOutputRecord, "createdAt">, error: unknown, now = Date.now()): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /\b404\b|not found/i.test(message) && now - record.createdAt >= SPENT_ELSEWHERE_GRACE_MS;
+}
+
+/** Whether a stealth UTXO no longer exists (the indexer says not found). Any other failure: assume it does. */
+async function utxoGone(provider: IndexerProvider, resourceAddress: string, commitmentHex: string): Promise<boolean> {
+  try {
+    await provider.getSubstate(stealthUtxoSubstateId(resourceAddress, fromHex(commitmentHex)));
+    return false;
+  } catch (e) {
+    return /[^0-9]404[^0-9]|not found/i.test(` ${e instanceof Error ? e.message : String(e)} `);
+  }
+}
+
+/** Whether a recent-transactions entry committed, failed, or isn't finalized yet. */
+export function transactionOutcome(entry: unknown): "committed" | "failed" | "pending" {
+  const e = entry as { rejected_reason?: unknown; summary?: { outcome?: unknown } | null };
+  if (e.rejected_reason !== null && e.rejected_reason !== undefined) return "failed";
+  const outcome = e.summary?.outcome;
+  if (outcome === undefined || outcome === null) return "pending";
+  return outcome === "Commit" ? "committed" : "failed";
 }
 
 export function selectShieldedUtxosForAmount(
