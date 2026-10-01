@@ -1970,38 +1970,58 @@ export class OotleAccount implements WalletAccountApi {
     }
   }
 
+  /**
+   * The records worth spending: every unspent record of `resourceAddress` is checked against the
+   * chain (not just enough of them to cover `targetAmount` -- a plan can reach past that, e.g.
+   * unshield's extra change input), and one that can't be read is left out. A record the indexer
+   * reports as not found is one that was spent elsewhere (another device or wallet on this seed) and
+   * is marked spent for good -- see `isSpentElsewhere` for the guard on fresh outputs. Any other
+   * failure only skips the record this time.
+   */
   private async filterReadableShieldedOutputs(
     records: ShieldedOutputRecord[],
     resourceAddress: string,
-    targetAmount: bigint
+    // Kept for callers' clarity; every candidate is checked regardless.
+    _targetAmount: bigint
   ): Promise<ShieldedOutputRecord[]> {
+    const unreadable = await this.checkShieldedOutputs(records.filter((r) => r.resourceAddress === resourceAddress));
+    return records.filter((r) => !unreadable.has(r.commitment));
+  }
+
+  /**
+   * Checks every unspent local shielded-output record against the chain and marks spent the ones
+   * that are gone (spent from another device or wallet sharing this seed), so the private balance
+   * and coin selection stop counting them. Returns how many were marked. Safe to call any time; a
+   * record the indexer can't answer for right now is left as it is.
+   */
+  async pruneSpentShieldedOutputs(): Promise<number> {
+    const accountId = localAccountId(this.index);
+    const before = (await listShieldedOutputs(accountId)).filter((r) => !r.spent).length;
+    await this.checkShieldedOutputs(await listShieldedOutputs(accountId));
+    const after = (await listShieldedOutputs(accountId)).filter((r) => !r.spent).length;
+    return before - after;
+  }
+
+  /** Reads each unspent record's UTXO; returns the unusable commitments, marking the definitively spent ones. */
+  private async checkShieldedOutputs(records: ShieldedOutputRecord[]): Promise<Set<string>> {
+    const accountId = localAccountId(this.index);
     const provider = await this.getProvider();
     const crypto = new WasmStealthCrypto(this.network);
     const viewSecret = await this.signer.getViewSecret();
-    const candidates = records
-      .filter((r) => r.resourceAddress === resourceAddress && !r.spent)
-      .sort((a, b) => {
-        const diff = BigInt(b.amount) - BigInt(a.amount);
-        return diff > 0n ? 1 : diff < 0n ? -1 : 0;
-      });
     const unreadable = new Set<string>();
-    let verifiedTotal = 0n;
-    for (const record of candidates) {
-      if (verifiedTotal >= targetAmount) break;
+    for (const record of records) {
+      if (record.spent) continue;
       try {
-        const substateId = stealthUtxoSubstateId(resourceAddress, fromHex(record.commitment));
+        const substateId = stealthUtxoSubstateId(record.resourceAddress, fromHex(record.commitment));
         const substate = await provider.getSubstate(substateId);
         const decrypted = await decryptOwnedUtxo(crypto, viewSecret, substate, substateId);
-        if (!decrypted) {
-          unreadable.add(record.commitment); // doesn't decrypt as ours -- don't offer it either
-          continue;
-        }
-        verifiedTotal += BigInt(record.amount);
-      } catch {
+        if (!decrypted) unreadable.add(record.commitment); // doesn't decrypt as ours -- don't offer it either
+      } catch (e) {
         unreadable.add(record.commitment);
+        if (isSpentElsewhere(record, e)) await markShieldedOutputSpent(accountId, record.commitment);
       }
     }
-    return records.filter((r) => !unreadable.has(r.commitment));
+    return unreadable;
   }
 
   /**
@@ -2840,6 +2860,15 @@ export class OotleAccount implements WalletAccountApi {
       resourceAddress,
       amount
     );
+    // An account that has only ever held private funds (e.g. a claimed L1 burn) has no component
+    // on-chain to take the dust or a public fee from, so its send pays the fee from itself, like
+    // unshield's new-account path.
+    if (!(await substateExists(await this.getProvider(), await this.getComponentAddress()))) {
+      if (resourceAddress !== TARI_RESOURCE_ADDRESS) {
+        throw new Error("This account doesn't exist on-chain yet, so it can only send TARI privately until it is created (unshield some TARI first).");
+      }
+      return this.sendPrivatelyPayingFeeFromTransfer(records, resourceAddress, recipientWalletAddress, amount, maxFee, memo, minimumValuePromise, opId);
+    }
     // A private fee normally comes from a UTXO of its own. With none to spare -- e.g. the whole
     // private balance is a single UTXO -- the fee comes out of the send itself instead.
     if (feeType.kind === "private" && feeType.feeResourceAddress === resourceAddress) {
@@ -3721,6 +3750,20 @@ export function summarizePrivateHoldings(
     totals.set(record.resourceAddress, entry);
   }
   return [...totals].map(([resourceAddress, entry]) => ({ resourceAddress, ...entry }));
+}
+
+/** How long a freshly recorded output may still be missing from the indexer before "not found" is believed. */
+const SPENT_ELSEWHERE_GRACE_MS = 10 * 60_000;
+
+/**
+ * Whether a failed read of a record's UTXO means it is gone for good: the indexer said the
+ * substate is not found (a spent UTXO is removed), and the record is old enough that this isn't
+ * just the indexer not having caught up with a brand-new output. A 500 or a network error says
+ * nothing about the UTXO and never counts.
+ */
+export function isSpentElsewhere(record: Pick<ShieldedOutputRecord, "createdAt">, error: unknown, now = Date.now()): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /\b404\b|not found/i.test(message) && now - record.createdAt >= SPENT_ELSEWHERE_GRACE_MS;
 }
 
 export function selectShieldedUtxosForAmount(

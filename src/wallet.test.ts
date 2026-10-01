@@ -11,6 +11,7 @@ import {
   resolveSendPrivatelyPlan,
   resolveUnshieldPlan,
   selectPrivateFeeUtxo,
+  isSpentElsewhere,
   selectShieldedUtxosForAmount,
   selectUnspentShieldedOutputs,
   substateExists,
@@ -568,5 +569,23 @@ describe("assertValidMinimumValuePromise", () => {
     const amount = 9007199254740993n; // 2^53 + 1
     expect(() => assertValidMinimumValuePromise(amount, amount)).not.toThrow();
     expect(() => assertValidMinimumValuePromise(amount + 1n, amount)).toThrow(/cannot exceed/);
+  });
+});
+
+describe("isSpentElsewhere", () => {
+  const now = 1_000_000_000_000;
+  const old = { createdAt: now - 60 * 60_000 };
+  const fresh = { createdAt: now - 60_000 };
+  const notFound = new Error('HTTP 404: - {"error":"Substate utxo_01_ab not found"}');
+
+  it("believes a not-found for a record older than the grace period", () => {
+    expect(isSpentElsewhere(old, notFound, now)).toBe(true);
+  });
+  it("doesn't for a fresh record the indexer may not have caught up with", () => {
+    expect(isSpentElsewhere(fresh, notFound, now)).toBe(false);
+  });
+  it("never counts a server or network error", () => {
+    expect(isSpentElsewhere(old, new Error("HTTP 500: internal error"), now)).toBe(false);
+    expect(isSpentElsewhere(old, new TypeError("Failed to fetch"), now)).toBe(false);
   });
 });
