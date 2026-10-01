@@ -1816,6 +1816,160 @@ export class OotleAccount implements WalletAccountApi {
    * deleting one is unrecoverable. A record skipped here is simply not offered as a candidate for
    * *this* attempt; it stays in local storage to be tried again later.
    */
+  /** Whether any of these unspent records of `resourceAddress` holds more than `floor` and still reads (decrypts as ours) on chain. */
+  private async hasReadableUtxoAbove(records: ShieldedOutputRecord[], resourceAddress: string, floor: bigint): Promise<boolean> {
+    const provider = await this.getProvider();
+    const crypto = new WasmStealthCrypto(this.network);
+    const viewSecret = await this.signer.getViewSecret();
+    for (const record of records) {
+      if (record.spent || record.resourceAddress !== resourceAddress || BigInt(record.amount) <= floor) continue;
+      try {
+        const substateId = stealthUtxoSubstateId(resourceAddress, fromHex(record.commitment));
+        if (await decryptOwnedUtxo(crypto, viewSecret, await provider.getSubstate(substateId), substateId)) return true;
+      } catch {
+        /* spent elsewhere or unreachable: not usable for the fee */
+      }
+    }
+    return false;
+  }
+
+  /**
+   * `sendPrivately()` with a private fee taken from the send itself, for when no separate UTXO can
+   * pay it. One `StealthTransfer` in the fee phase spends the selected inputs into the recipient's
+   * output and this account's change, and reveals only the fee, which pays for the transaction
+   * (`PayFeeFromBucket`) -- the same shape `unshieldIntoNewAccount` uses, with no public funds or
+   * account component involved. The fee is measured with a dry run first, since a fee revealed from
+   * stealth funds is never refunded.
+   */
+  private async sendPrivatelyPayingFeeFromTransfer(
+    records: ShieldedOutputRecord[],
+    resourceAddress: string,
+    recipientWalletAddress: string,
+    amount: bigint,
+    maxFee: bigint,
+    memo: string | undefined,
+    minimumValuePromise: bigint,
+    opId: string
+  ): Promise<{ transactionId: string; recipientCommitment: string; recipientSubstateId: string; minimumValuePromise: string }> {
+    const accountId = localAccountId(this.index);
+    // The caller checked readability up to `amount` only; the fee needs more, and a stale record
+    // (spent from another device) must not be picked for it.
+    records = await this.filterReadableShieldedOutputs(records, resourceAddress, amount + maxFee);
+    let commitments: string[];
+    try {
+      ({ commitments } = resolveSendPrivatelyPlan(records, resourceAddress, amount + maxFee));
+    } catch {
+      throw new Error(`Not enough private balance to send ${amount} and pay its private fee (up to ${maxFee}) from it.`);
+    }
+    await reserveCommitments(accountId, commitments, opId);
+    try {
+      const provider = await this.getProvider();
+      const crypto = new WasmStealthCrypto(this.network);
+      const viewSecret = await this.signer.getViewSecret();
+      const walletAddress = await this.getWalletAddress();
+
+      const inputs = await Promise.all(
+        commitments.map(async (commitmentHex) => {
+          const substateId = stealthUtxoSubstateId(resourceAddress, fromHex(commitmentHex));
+          const substate = await provider.getSubstate(substateId);
+          const decrypted = await decryptOwnedUtxo(crypto, viewSecret, substate, substateId);
+          if (!decrypted) throw new Error(`sendPrivately: cannot decrypt ${substateId} -- it isn't this account's, or it is already spent.`);
+          const nonce = (substate as unknown as { substate: { Utxo: { output: { output: { public_nonce: string } } } } }).substate.Utxo.output.output
+            .public_nonce;
+          return { commitmentHex, substateId, mask: decrypted.mask, nonce, value: decrypted.value };
+        })
+      );
+      const total = inputs.reduce((sum, i) => sum + i.value, 0n);
+      const inputMask = await crypto.aggregateInputMasks(inputs.map((i) => i.mask));
+      const inputsJson = JSON.stringify({
+        inputs: inputs.map((i) => ({ commitment: i.commitmentHex, witness: "KeyPath" })),
+        revealed_amount: "0",
+      });
+      const sealKeypair = generateSealKeypair();
+
+      const build = async (fee: bigint, dryRun: boolean) => {
+        const change = total - amount - fee;
+        if (change < 0n) throw new Error(`sendPrivately: ${total} private does not cover ${amount} plus the ${fee} fee`);
+        // Output 0 is the recipient's (the promise rides on it alone -- see sendPrivately); output 1, when present, is our change.
+        const outputs = [createOutput({ destination: recipientWalletAddress, amount, resourceAddress, memo: toMemo(memo), minimumValuePromise })];
+        if (change > 0n) outputs.push(createOutput({ destination: walletAddress, amount: change, resourceAddress }));
+        const { statement: outputsStatement, outputMask } = await crypto.generateOutputsStatement(outputs, fee, sealKeypair.public_key);
+        const inputsStatement = new StealthInputsStatement([], 0n, inputsJson);
+        const balanceProof = await crypto.generateBalanceProofSignature(inputMask, outputMask, inputsJson, outputsStatement.statementJson);
+        const statement = new StealthTransferStatement(inputsStatement, outputsStatement, balanceProof);
+        await crypto.validateTransfer(statement);
+        const parsed = (outputsStatement.parsed() as { outputs: { output: { commitment: string } }[] }).outputs;
+
+        const builder = TransactionBuilder.new(this.network, await resolveMaxEpoch(provider));
+        for (const instruction of [
+          {
+            StealthTransfer: {
+              resource_address_ref: { Address: resourceAddress },
+              statement: { __ootleRawJson: statement.toCompactJson() },
+              revealed_input_bucket: null,
+            },
+          },
+          { PutLastInstructionOutputOnWorkspace: { key: 0 } },
+          { PayFeeFromBucket: { bucket: { id: 0, offset: null } } },
+        ]) {
+          builder.addFeeInstruction(instruction as unknown as Instruction);
+        }
+        builder.addInput({ substate_id: resourceAddress, version: null, is_write: false });
+        for (const input of inputs) builder.addInput({ substate_id: input.substateId, version: null });
+        const unsignedBody = builder.buildUnsignedTransaction();
+        unsignedBody.is_seal_signer_authorized = true;
+        unsignedBody.dry_run = dryRun;
+        const unsignedTx = await resolveTransaction(provider, unsignedBody);
+        const signers: Signer[] = inputs.map((input) => ({
+          getAddress: async () => walletAddress,
+          getPublicKey: async () => parseOotleAddress(walletAddress).owner_key,
+          signTransaction: async (tx: UnsignedTransactionWithBlobs, sealPublicKey: Uint8Array) => {
+            const json = serializeUnsignedTx(tx);
+            return [await this.signer.addStealthSignature!(json, fromHex(input.nonce), sealPublicKey, { crypto })];
+          },
+        }));
+        const signed = await signTransaction(signers, unsignedTx, sealKeypair);
+        return {
+          envelope: sealTransaction(signed),
+          change,
+          recipientCommitment: parsed[0]!.output.commitment,
+          changeCommitment: change > 0n ? parsed[1]!.output.commitment : undefined,
+        };
+      };
+
+      const fee = await this.estimateClaimFee(await build(maxFee, true), "private send");
+      if (fee > maxFee) throw new Error(`sendPrivately: the private fee would be ${fee}, above the ${maxFee} limit`);
+      const attempt = await build(fee, false);
+      const transactionId = await submitTransaction(provider, attempt.envelope);
+      await addPendingShield({
+        transactionId,
+        accountId,
+        resourceAddress,
+        amount: attempt.change.toString(),
+        spentCommitments: commitments,
+        ownCommitment: attempt.changeCommitment,
+      });
+      try {
+        const response = await withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the private send");
+        await recordKnownVersions(response);
+        if (attempt.changeCommitment) {
+          await recordKnownShieldedOutput(accountId, resourceAddress, attempt.changeCommitment, attempt.change, transactionId);
+        }
+        for (const commitment of commitments) await markShieldedOutputSpent(accountId, commitment);
+      } finally {
+        await removePendingShield(transactionId);
+      }
+      return {
+        transactionId,
+        recipientCommitment: attempt.recipientCommitment,
+        recipientSubstateId: stealthUtxoSubstateId(resourceAddress, fromHex(attempt.recipientCommitment)),
+        minimumValuePromise: minimumValuePromise.toString(),
+      };
+    } finally {
+      await releaseReservations(opId);
+    }
+  }
+
   private async filterReadableShieldedOutputs(
     records: ShieldedOutputRecord[],
     resourceAddress: string,
@@ -2686,6 +2840,15 @@ export class OotleAccount implements WalletAccountApi {
       resourceAddress,
       amount
     );
+    // A private fee normally comes from a UTXO of its own. With none to spare -- e.g. the whole
+    // private balance is a single UTXO -- the fee comes out of the send itself instead.
+    if (feeType.kind === "private" && feeType.feeResourceAddress === resourceAddress) {
+      const planned = resolveSendPrivatelyPlan(records, resourceAddress, amount).commitments;
+      const spare = records.filter((r) => !planned.includes(r.commitment));
+      if (!(await this.hasReadableUtxoAbove(spare, resourceAddress, maxFee))) {
+        return this.sendPrivatelyPayingFeeFromTransfer(records, resourceAddress, recipientWalletAddress, amount, maxFee, memo, minimumValuePromise, opId);
+      }
+    }
     const { commitments, changeAmount } = resolveSendPrivatelyPlan(records, resourceAddress, amount);
     await reserveCommitments(accountId, commitments, opId);
     try {
