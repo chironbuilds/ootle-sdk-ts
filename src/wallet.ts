@@ -4132,7 +4132,25 @@ export async function pollTransactionResult(
 ): Promise<IndexerGetTransactionResultResponse> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const response = await provider.getTransactionResult(transactionId);
+    let response: IndexerGetTransactionResultResponse;
+    try {
+      response = await provider.getTransactionResult(transactionId);
+    } catch (err) {
+      // A transaction the indexer hasn't ingested yet (submitted moments ago, not yet in its
+      // local view) surfaces as a plain 404 "not found" -- the same race resolveInputsWithRetry
+      // below exists for, just on the transaction id instead of a substate id. Confirmed
+      // empirically this clears within a round trip or two; a genuinely-bad transaction id never
+      // starts existing no matter how long this waits, so this retries within the same budget as
+      // the "Pending" branch below and lets a persistent not-found surface as a real error once
+      // the deadline passes.
+      const message = err instanceof Error ? err.message : String(err);
+      if (/not found/i.test(message)) {
+        if (Date.now() > deadline) throw new Error(`Timed out waiting for transaction ${transactionId} to finalize.`);
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        continue;
+      }
+      throw err;
+    }
     const result = response.result;
     if (result === "Pending") {
       if (Date.now() > deadline) throw new Error(`Timed out waiting for transaction ${transactionId} to finalize.`);
