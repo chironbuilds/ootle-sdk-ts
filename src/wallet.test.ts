@@ -154,8 +154,9 @@ describe("resolveInputsWithRetry", () => {
     } as unknown as IndexerProvider;
 
     const result = await runWithFakeBackoff(resolveInputsWithRetry(provider, [requirement], 5, 500));
-    // resolveInputsWithRetry now tags inputs with `is_write` (required by 0.47's InputDeclaration).
-    expect(result).toEqual([{ ...requirement, version: 0, is_write: false }]);
+    // resolveInputsWithRetry defaults inputs to writable (is_write: true), matching the
+    // published ootle behaviour, so withdraw/deposit writes are not rejected.
+    expect(result).toEqual([{ ...requirement, version: 0, is_write: true }]);
     expect(calls).toBe(3);
   });
 

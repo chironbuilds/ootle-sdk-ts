@@ -1012,8 +1012,8 @@ export class OotleAccount implements WalletAccountApi {
     for (let attempt = 0; ; attempt++) {
       const inputs = await withTimeout(
         provider.resolveInputs([
-          { substate_id: XTR_FAUCET_COMPONENT_ADDRESS, version: null, is_write: false },
-          { substate_id: XTR_FAUCET_VAULT_ADDRESS, version: null, is_write: false },
+          { substate_id: XTR_FAUCET_COMPONENT_ADDRESS, version: null, is_write: true },
+          { substate_id: XTR_FAUCET_VAULT_ADDRESS, version: null, is_write: true },
           { substate_id: XTR_FAUCET_CLAIM_RESOURCE_ADDRESS, version: null, is_write: false },
         ]),
         15_000,
@@ -4214,7 +4214,7 @@ export async function resolveInputsWithRetry(
 ): Promise<SubstateRequirement[]> {
   for (let attempt = 0; ; attempt++) {
     try {
-      return await withTimeout(provider.resolveInputs(requirements.map((r) => ({ ...r, is_write: false }))), 15_000, "resolving inputs");
+      return await withTimeout(provider.resolveInputs(requirements.map((r) => ({ ...r, is_write: (r as { is_write?: boolean }).is_write ?? true }))), 15_000, "resolving inputs");
     } catch (e) {
       const isNotYetFinalized = e instanceof Error && RESOLVE_INPUTS_NOT_YET_FINALIZED_PATTERN.test(e.message);
       if (!isNotYetFinalized || attempt >= retries) throw e;
