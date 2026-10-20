@@ -154,7 +154,8 @@ describe("resolveInputsWithRetry", () => {
     } as unknown as IndexerProvider;
 
     const result = await runWithFakeBackoff(resolveInputsWithRetry(provider, [requirement], 5, 500));
-    expect(result).toEqual([{ ...requirement, version: 0 }]);
+    // resolveInputsWithRetry now tags inputs with `is_write` (required by 0.47's InputDeclaration).
+    expect(result).toEqual([{ ...requirement, version: 0, is_write: false }]);
     expect(calls).toBe(3);
   });
 

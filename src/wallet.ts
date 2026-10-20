@@ -45,9 +45,7 @@ import { IndexerProvider } from "@tari-project/ootle-indexer";
 import { SecretKeyWallet } from "@tari-project/ootle-secret-key-wallet";
 import {
   buildScriptPathWitness,
-  burnClaimStealthSecret,
   buildStealthTransferStatement,
-  createConfidentialWithdrawProofLiteral,
   createStealthOutputWitness,
   encryptedDataDhKdfAead,
   parseOotleAddress,
@@ -55,9 +53,20 @@ import {
   schnorrSign,
   stealthDhSecret,
   unblindOutput,
-  validateBurnClaimOwnershipProof,
   validateStealthTransfer,
 } from "@tari-project/ootle-wasm";
+// Burn-claim / confidential-withdraw crypto helpers were not upstreamed into
+// @tari-project/ootle-wasm@0.47.0; they are stable pure-crypto wrappers over
+// tari_ootle_wallet_crypto, kept from the vendored build.
+import {
+  burnClaimStealthSecret,
+  createConfidentialWithdrawProofLiteral,
+  validateBurnClaimOwnershipProof,
+} from "@chironbuilder/ootle-wasm-legacy";
+// The HTLC-fund flow needs chironbuilds's StealthTransfer extensions (toRevealedOutputAsBucket /
+// andThen) that were not kept in the published @tari-project/ootle@0.47; routed through the
+// vendored build for this one flow. Validated by htlc.test.ts / htlcSafety.test.ts.
+import { StealthTransfer as HtlcStealthTransfer } from "@chironbuilder/ootle-legacy";
 import type { WalletAccountApi } from "./accountApi.js";
 import type { BurnClaimProofContents } from "./burnClaim.js";
 import { componentAddressFromWalletAddress, deriveAccountComponentAddress } from "./componentAddress.js";
@@ -1003,9 +1012,9 @@ export class OotleAccount implements WalletAccountApi {
     for (let attempt = 0; ; attempt++) {
       const inputs = await withTimeout(
         provider.resolveInputs([
-          { substate_id: XTR_FAUCET_COMPONENT_ADDRESS, version: null },
-          { substate_id: XTR_FAUCET_VAULT_ADDRESS, version: null },
-          { substate_id: XTR_FAUCET_CLAIM_RESOURCE_ADDRESS, version: null },
+          { substate_id: XTR_FAUCET_COMPONENT_ADDRESS, version: null, is_write: false },
+          { substate_id: XTR_FAUCET_VAULT_ADDRESS, version: null, is_write: false },
+          { substate_id: XTR_FAUCET_CLAIM_RESOURCE_ADDRESS, version: null, is_write: false },
         ]),
         15_000,
         "resolving the faucet's current state"
@@ -1108,7 +1117,7 @@ export class OotleAccount implements WalletAccountApi {
     // live). See getWalletAddress()'s doc comment for why these two addresses are easy to conflate.
     const walletAddress = await this.getWalletAddress();
 
-    const builder = new StealthTransfer(provider, resourceAddress).withRevealedReceiver(this.accountPublicKey)
+    const builder = new StealthTransfer(provider, resourceAddress)
       // StealthTransfer.prepare() auto-adds the revealed account's own substate and any vault
       // addresses embedded in its on-chain state, but never the resource's own substate -- fine
       // for XTR (resource_0101...0101 is engine-special-cased and needs no lock), but any other
@@ -1171,7 +1180,7 @@ export class OotleAccount implements WalletAccountApi {
   ): Promise<{ publicKey: string; publicNonce: string; signature: string }> {
     const provider = await this.getProvider();
     const response = await provider.getSubstate(substateId);
-    const substate = response.substate as unknown as { Utxo?: { output: { output: OutputBody; auth: { Key?: string } } | null } };
+    const substate = response.state as unknown as { Utxo?: { output: { output: OutputBody; auth: { Key?: string } } | null } };
     const utxo = substate.Utxo;
     if (!utxo?.output) {
       throw new Error("This output doesn't exist, isn't a stealth output, or has already been spent.");
@@ -1279,7 +1288,7 @@ export class OotleAccount implements WalletAccountApi {
 
       // See shield()'s comment: the resource's own substate must be pinned explicitly -- prepare()
       // never adds it on its own.
-      let builder = new StealthTransfer(provider, resourceAddress).withRevealedReceiver(this.accountPublicKey)
+      let builder = new StealthTransfer(provider, resourceAddress)
         .withBuilder((b) => b.addInput({ substate_id: resourceAddress, version: null }))
         .spendRevealedInput(account, dust);
       for (const commitment of commitments) {
@@ -1287,7 +1296,7 @@ export class OotleAccount implements WalletAccountApi {
       }
       builder = builder
         .toStealthOutput(createOutput({ destination: walletAddress, amount: remainder, resourceAddress, memo: toMemo(memo) }))
-        .toRevealedOutput(revealedOutAmount + dust);
+        .toRevealedOutput(revealedOutAmount + dust, this.accountPublicKey);
 
       const viewSecret = await this.signer.getViewSecret();
       // See shield()'s comment: must pass this account's real network, not fromSpec's LocalNet
@@ -1385,20 +1394,20 @@ export class OotleAccount implements WalletAccountApi {
     // amount as a revealed bucket.
     const dust = 1n;
 
-    let builder = new StealthTransfer(provider, resourceAddress).withRevealedReceiver(this.accountPublicKey)
-      .withBuilder((b) => b.addInput({ substate_id: resourceAddress, version: null }))
+    let builder = new HtlcStealthTransfer(provider, resourceAddress)
+      .withBuilder((b: any) => b.addInput({ substate_id: resourceAddress, version: null }))
       .spendRevealedInput(account, amount + dust)
       .toStealthOutput(createOutput({ destination: walletAddress, amount: dust, resourceAddress }))
       .toRevealedOutputAsBucket(amount, workspaceVarName)
       .andThen(followUpInstructions);
     for (const component of relatedComponents) {
-      builder = builder.withBuilder((b) => b.addInput({ substate_id: component, version: null }));
+      builder = builder.withBuilder((b: any) => b.addInput({ substate_id: component, version: null }));
       for (const vaultId of await getVaultIdsForAccount(provider, component)) {
-        builder = builder.withBuilder((b) => b.addInput({ substate_id: vaultId, version: null }));
+        builder = builder.withBuilder((b: any) => b.addInput({ substate_id: vaultId, version: null }));
       }
     }
     const viewSecret = await this.signer.getViewSecret();
-    const { transactionId, privateFee } = await this.prepareSignSubmit(builder, provider, account, maxFee, feeType, { viewSecret });
+    const { transactionId, privateFee } = await this.prepareSignSubmit(builder as unknown as StealthTransfer, provider, account, maxFee, feeType, { viewSecret });
     const response = await withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the transaction");
     await recordKnownVersions(response);
     if (privateFee && feeType.kind === "private") {
@@ -1518,7 +1527,7 @@ export class OotleAccount implements WalletAccountApi {
         revealedInput: null,
         inputsToSpend: new Map([[commitmentHex, { input: new StealthInput(commitment), owner: account }]]),
         outputs: [],
-        revealedOutputAmount: revealedAmount,
+        revealedOutput: revealedAmount > 0n ? { amount: revealedAmount, receiver: this.accountPublicKey } : null,
       },
       requiredSigners: [account],
       inputs: [{ input: new StealthInput(commitment), owner: account }],
@@ -1634,9 +1643,8 @@ export class OotleAccount implements WalletAccountApi {
     const feeChangeOutput = createOutput({ destination: walletAddress, amount: feeChange, resourceAddress: feeResourceAddress });
     const { statement: feeOutputsStatement, outputMask: feeOutputMask } = await crypto.generateOutputsStatement(
       [feeChangeOutput],
-      maxFee,
       // The revealed fee goes to the fee UTXO's one-time key, which signs for it (see `feeSigner`).
-      utxoSpendKey(substate)
+      maxFee > 0n ? { amount: maxFee, receiver: utxoSpendKey(substate) } : null,
     );
     const feeInputsStatement = new StealthInputsStatement([], 0n, inputSkeleton);
     const feeAggInputMask = await crypto.aggregateInputMasks([decrypted.mask]);
@@ -1898,7 +1906,7 @@ export class OotleAccount implements WalletAccountApi {
         // Output 0 is the recipient's (the promise rides on it alone -- see sendPrivately); output 1, when present, is our change.
         const outputs = [createOutput({ destination: recipientWalletAddress, amount, resourceAddress, memo: toMemo(memo), minimumValuePromise })];
         if (change > 0n) outputs.push(createOutput({ destination: walletAddress, amount: change, resourceAddress }));
-        const { statement: outputsStatement, outputMask } = await crypto.generateOutputsStatement(outputs, fee, sealKeypair.public_key);
+        const { statement: outputsStatement, outputMask } = await crypto.generateOutputsStatement(outputs, fee > 0n ? { amount: fee, receiver: sealKeypair.public_key } : null);
         const inputsStatement = new StealthInputsStatement([], 0n, inputsJson);
         const balanceProof = await crypto.generateBalanceProofSignature(inputMask, outputMask, inputsJson, outputsStatement.statementJson);
         const statement = new StealthTransferStatement(inputsStatement, outputsStatement, balanceProof);
@@ -2325,7 +2333,7 @@ export class OotleAccount implements WalletAccountApi {
       // See shield()'s comment: the resource's own substate must be pinned explicitly -- prepare()
       // never adds it on its own. Output 0 is the HTLC; output 1 (only with change) is ours.
       const build = () => {
-        let b = new StealthTransfer(provider, resourceAddress).withRevealedReceiver(this.accountPublicKey).withBuilder((bb) => bb.addInput({ substate_id: resourceAddress, version: null }));
+        let b = new StealthTransfer(provider, resourceAddress).withBuilder((bb) => bb.addInput({ substate_id: resourceAddress, version: null }));
         if (stealth) for (const c of commitments) b = b.spendStealthInput(account, fromHex(c));
         else b = b.spendRevealedInput(account, amount);
         // `destination` is the claimant's own wallet address so they can independently decrypt and
@@ -2907,7 +2915,7 @@ export class OotleAccount implements WalletAccountApi {
 
       // See shield()'s comment: the resource's own substate must be pinned explicitly -- prepare()
       // never adds it on its own.
-      let builder = new StealthTransfer(provider, resourceAddress).withRevealedReceiver(this.accountPublicKey)
+      let builder = new StealthTransfer(provider, resourceAddress)
         .withBuilder((b) => b.addInput({ substate_id: resourceAddress, version: null }))
         .spendRevealedInput(account, dust);
       for (const commitment of commitments) {
@@ -2922,7 +2930,7 @@ export class OotleAccount implements WalletAccountApi {
       if (changeAmount > 0n) {
         builder = builder.toStealthOutput(createOutput({ destination: ownWalletAddress, amount: changeAmount, resourceAddress }));
       }
-      builder = builder.toRevealedOutput(dust);
+      builder = builder.toRevealedOutput(dust, this.accountPublicKey);
 
       const viewSecret = await this.signer.getViewSecret();
       // `commitments` excluded from the fee UTXO's own selection -- see unshield()'s identical
@@ -3127,7 +3135,7 @@ export class OotleAccount implements WalletAccountApi {
       let outputMask = Mask.zero();
       if (change > 0n) {
         const output = createOutput({ destination: walletAddress, amount: change, resourceAddress, memo: toMemo(memo) });
-        ({ statement: outputsStatement, outputMask } = await crypto.generateOutputsStatement([output], revealed, sealKeypair.public_key));
+        ({ statement: outputsStatement, outputMask } = await crypto.generateOutputsStatement([output], revealed > 0n ? { amount: revealed, receiver: sealKeypair.public_key } : null));
       } else {
         outputsStatement = new StealthOutputsStatement(revealOnlyOutputsJson(revealed, sealKeypair.public_key));
       }
@@ -3235,7 +3243,7 @@ export class OotleAccount implements WalletAccountApi {
         throw new Error(`claimBurn: the burn (${decrypted.value}) does not cover the claim fee (${fee})`);
       }
       const output = createOutput({ destination: walletAddress, amount: claimedAmount, resourceAddress: TARI_RESOURCE_ADDRESS, memo: toMemo(memo) });
-      const { statement: outputsStatement, outputMask } = await crypto.generateOutputsStatement([output], fee, sealKeypair.public_key);
+      const { statement: outputsStatement, outputMask } = await crypto.generateOutputsStatement([output], fee > 0n ? { amount: fee, receiver: sealKeypair.public_key } : null);
       // The single input is the UTXO `ClaimBurn` mints in the same transaction; the instruction
       // itself authorises spending it, so it carries no witness.
       const inputsStatement = await crypto.buildInputsStatement([new StealthInput(burnCommitment)], 0n);
@@ -3504,11 +3512,11 @@ export class OotleAccount implements WalletAccountApi {
             : undefined;
       if (!upSubstates) return;
 
-      for (const [substateId, substate] of upSubstates) {
+      for (const [substateId] of upSubstates) {
         if (!substateId.startsWith(prefix)) continue;
         const commitment = substateId.slice(prefix.length);
         if (knownCommitments.has(commitment)) continue;
-        const decrypted = await decryptOwnedUtxo(crypto, viewSecret, { ...substate, verified: true }, substateId);
+        const decrypted = await decryptOwnedUtxo(crypto, viewSecret, await provider.getSubstate(substateId), substateId);
         if (!decrypted) continue;
         const memo = fromMemo(decrypted.memo);
         await recordKnownShieldedOutput(accountId, resourceAddress, commitment, decrypted.value, transactionId, memo);
@@ -4206,7 +4214,7 @@ export async function resolveInputsWithRetry(
 ): Promise<SubstateRequirement[]> {
   for (let attempt = 0; ; attempt++) {
     try {
-      return await withTimeout(provider.resolveInputs(requirements), 15_000, "resolving inputs");
+      return await withTimeout(provider.resolveInputs(requirements.map((r) => ({ ...r, is_write: false }))), 15_000, "resolving inputs");
     } catch (e) {
       const isNotYetFinalized = e instanceof Error && RESOLVE_INPUTS_NOT_YET_FINALIZED_PATTERN.test(e.message);
       if (!isNotYetFinalized || attempt >= retries) throw e;

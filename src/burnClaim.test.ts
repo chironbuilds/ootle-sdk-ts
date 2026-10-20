@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { burnClaimStealthSecret, publicKeyFromSecretKey, validateBurnClaimOwnershipProof } from "@tari-project/ootle-wasm";
+import { publicKeyFromSecretKey } from "@tari-project/ootle-wasm";
+import { burnClaimStealthSecret, validateBurnClaimOwnershipProof } from "@chironbuilder/ootle-wasm-legacy";
 import { Network, WasmStealthCrypto } from "@tari-project/ootle";
 import { assembleBurnClaimProof, claimProofFromL1, decodeBurnOutputFeatures, parseConsoleWalletBurnProof } from "./burnClaim";
 import type { BurnOutputProof } from "./burnClaim";
