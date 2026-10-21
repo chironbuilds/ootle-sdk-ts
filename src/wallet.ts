@@ -1399,6 +1399,13 @@ export class OotleAccount implements WalletAccountApi {
       .spendRevealedInput(account, amount + dust)
       .toStealthOutput(createOutput({ destination: walletAddress, amount: dust, resourceAddress }))
       .toRevealedOutputAsBucket(amount, workspaceVarName)
+      // The 0.47 patch requires every revealed output to name the public key allowed to take it
+      // (prepare() throws "a revealed output needs withRevealedReceiver(publicKey)" otherwise).
+      // `unshield`/`sendPrivately` fold this into `toRevealedOutput(amount, pubkey)`, but the
+      // legacy builder's `toRevealedOutputAsBucket` takes no receiver, so set it explicitly. The
+      // bucket is consumed by `followUpInstructions` in this same transaction, which is always
+      // signed with the account key — see `accountPublicKey`'s own doc comment (tari-ootle#2645).
+      .withRevealedReceiver(this.accountPublicKey)
       .andThen(followUpInstructions);
     for (const component of relatedComponents) {
       builder = builder.withBuilder((b: any) => b.addInput({ substate_id: component, version: null }));
