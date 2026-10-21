@@ -1686,7 +1686,7 @@ export class OotleAccount implements WalletAccountApi {
     // type, whose shape `decryptOwnedUtxo` already validated once. Same convention
     // `redeemStealthOutputWithPrivateFee` used before this was extracted.
     const feeSubstate = await provider.getSubstate(substateId);
-    const feeNonce = (feeSubstate as unknown as { substate: { Utxo: { output: { output: { public_nonce: string } } } } }).substate.Utxo.output
+    const feeNonce = utxoOf(feeSubstate).output
       .output.public_nonce;
     const feeSigner: Signer = {
       getAddress: async () => walletAddress,
@@ -1894,7 +1894,7 @@ export class OotleAccount implements WalletAccountApi {
           const substate = await provider.getSubstate(substateId);
           const decrypted = await decryptOwnedUtxo(crypto, viewSecret, substate, substateId);
           if (!decrypted) throw new Error(`sendPrivately: cannot decrypt ${substateId} -- it isn't this account's, or it is already spent.`);
-          const nonce = (substate as unknown as { substate: { Utxo: { output: { output: { public_nonce: string } } } } }).substate.Utxo.output.output
+          const nonce = utxoOf(substate).output.output
             .public_nonce;
           return { commitmentHex, substateId, mask: decrypted.mask, nonce, value: decrypted.value };
         })
@@ -2244,7 +2244,7 @@ export class OotleAccount implements WalletAccountApi {
     // `buildPrivateFeeInstructions` -- see this method's own doc comment for why no ordinary
     // account-key signature is added.
     const redeemedSubstate = await provider.getSubstate(redeemed.substateId);
-    const redeemedNonce = (redeemedSubstate as unknown as { substate: { Utxo: { output: { output: { public_nonce: string } } } } }).substate.Utxo
+    const redeemedNonce = utxoOf(redeemedSubstate)
       .output.output.public_nonce;
     const redeemedSigner: Signer = {
       getAddress: async () => walletAddress,
@@ -3115,7 +3115,7 @@ export class OotleAccount implements WalletAccountApi {
         const substate = await provider.getSubstate(substateId);
         const decrypted = await decryptOwnedUtxo(crypto, viewSecret, substate, substateId);
         if (!decrypted) throw new Error(`unshield: cannot decrypt ${substateId} -- it isn't this account's, or it is already spent.`);
-        const nonce = (substate as unknown as { substate: { Utxo: { output: { output: { public_nonce: string } } } } }).substate.Utxo.output.output
+        const nonce = utxoOf(substate).output.output
           .public_nonce;
         return { commitmentHex, substateId, mask: decrypted.mask, nonce };
       })
@@ -4333,6 +4333,17 @@ function describeSignedTx(signed: unknown): string {
   }
 }
 
+type StealthUtxo = { output: { output: { public_nonce: string }; auth?: Record<string, unknown> } };
+
+/**
+ * The `Utxo` of an indexer substate response. Ootle 0.47 nests the value under `state.up.substate`;
+ * older responses carried it as `substate` directly.
+ */
+function utxoOf(response: unknown): StealthUtxo {
+  const r = response as { state?: { up?: { substate?: { Utxo?: StealthUtxo } } }; substate?: { Utxo?: StealthUtxo } };
+  return (r.state?.up?.substate ?? r.substate)?.Utxo as StealthUtxo;
+}
+
 /**
  * The one-time spend key of a stealth UTXO substate (its `auth` `Key`, or `KeyAndScript.spend_key`).
  * A key-path spend of the UTXO is signed with this key, so its badge is in the transaction's auth
@@ -4340,7 +4351,7 @@ function describeSignedTx(signed: unknown): string {
  * this account deliberately doesn't sign with its own key.
  */
 function utxoSpendKey(substate: unknown): Uint8Array {
-  const auth = (substate as { substate?: { Utxo?: { output?: { auth?: Record<string, unknown> } } } }).substate?.Utxo?.output?.auth;
+  const auth = utxoOf(substate)?.output?.auth;
   const key = auth && "Key" in auth ? auth.Key : auth && "KeyAndScript" in auth ? (auth.KeyAndScript as { spend_key: unknown }).spend_key : undefined;
   if (typeof key !== "string" || !/^[0-9a-f]{64}$/i.test(key)) {
     throw new Error("This stealth output has no one-time spend key (it is script-only), so it can't be spent by key.");
