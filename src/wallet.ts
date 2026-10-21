@@ -750,6 +750,7 @@ export class OotleAccount implements WalletAccountApi {
     extraSigners: Signer[] = []
   ): Promise<{ transaction_id: TransactionId; result: ExecuteResult }> {
     const resolved = await resolveTransaction(provider, { ...unsignedTx, dry_run: true });
+    resolved.inputs = dedupeInputs(resolved.inputs);
     const signed = await signTransaction([this.signer, ...extraSigners], resolved);
     const envelope = sealTransaction(signed);
     const res = await fetch(`${defaultIndexerUrl(this.network)}/transactions/dry-run`, {
@@ -810,6 +811,7 @@ export class OotleAccount implements WalletAccountApi {
     extraSigners: Signer[] = []
   ): Promise<IndexerGetTransactionResultResponse & { transaction_id: TransactionId }> {
     const resolved = await resolveTransaction(provider, unsignedTx);
+    resolved.inputs = dedupeInputs(resolved.inputs);
     // Both of these parse the transaction inside the wasm as an untagged enum
     // (`ootle_wasm/core/src/transaction.rs`), so a single bad field anywhere collapses into "data
     // did not match any variant of untagged enum TransactionInput" with nothing naming the
@@ -1532,6 +1534,7 @@ export class OotleAccount implements WalletAccountApi {
       }
     }
     const unsignedTx = await resolveTransaction(provider, builder.buildUnsignedTransaction());
+    unsignedTx.inputs = dedupeInputs(unsignedTx.inputs);
 
     const spec: StealthTransferSpec = {
       unsignedTx,
@@ -1948,6 +1951,7 @@ export class OotleAccount implements WalletAccountApi {
         unsignedBody.is_seal_signer_authorized = true;
         unsignedBody.dry_run = dryRun;
         const unsignedTx = await resolveTransaction(provider, unsignedBody);
+        unsignedTx.inputs = dedupeInputs(unsignedTx.inputs);
         const signers: Signer[] = inputs.map((input) => ({
           getAddress: async () => walletAddress,
           getPublicKey: async () => parseOotleAddress(walletAddress).owner_key,
@@ -2133,14 +2137,40 @@ export class OotleAccount implements WalletAccountApi {
       withFee = builder.payFeeFromRevealed(maxFee);
     }
     const spec = await withFee.prepare();
+    // Collapse duplicate inputs before the wasm ever sees the transaction: a private fee paid in the
+    // same resource the operation itself spends adds that resource twice, which 0.47 rejects whole
+    // (see `dedupeInputs`). Done on the spec the authorizer then signs, so every signature covers
+    // the same deduplicated transaction.
+    (spec.unsignedTx as { inputs: SubstateRequirement[] }).inputs = dedupeInputs((spec.unsignedTx as { inputs: SubstateRequirement[] }).inputs);
     // `dry_run` is part of the signed transaction, so it must be set before authorization/sealing.
     if (opts.dryRun) (spec.unsignedTx as { dry_run?: boolean }).dry_run = true;
     const wallet = new OotleWallet().registerKeyProvider(account, this.signer).setDefaultSigner(account);
-    const authorized = await WalletStealthAuthorizer.fromSpec(wallet, spec, {
-      crypto: new WasmStealthCrypto(this.network),
-      ...(opts.authorizerOpts ?? {}),
-    }).prepare(provider);
-    const envelope = privateFee ? await this.sealWithPrivateFee(authorized, privateFee.feeSigner) : await authorized.seal();
+    // Authorization and sealing parse the transaction inside the wasm as an untagged enum, so a
+    // single bad field collapses into "did not match any variant of untagged enum TransactionInput"
+    // with nothing naming the culprit (the same failure `submitReal` already enriches). This path --
+    // every StealthTransfer-based op, private fee included -- had no such enrichment, so attach the
+    // serialized transaction (the only evidence, gone by the time the error surfaces) here too.
+    let authorized: AuthorizedTransfer;
+    try {
+      authorized = await WalletStealthAuthorizer.fromSpec(wallet, spec, {
+        crypto: new WasmStealthCrypto(this.network),
+        ...(opts.authorizerOpts ?? {}),
+      }).prepare(provider);
+    } catch (e) {
+      throw new Error(
+        `${e instanceof Error ? e.message : String(e)} — at WalletStealthAuthorizer.prepare; tx: ${describeResolvedTx(spec.unsignedTx)}`,
+        { cause: e },
+      );
+    }
+    let envelope: string;
+    try {
+      envelope = privateFee ? await this.sealWithPrivateFee(authorized, privateFee.feeSigner) : await authorized.seal();
+    } catch (e) {
+      throw new Error(
+        `${e instanceof Error ? e.message : String(e)} — at ${privateFee ? "sealWithPrivateFee" : "seal"}; tx: ${describeResolvedTx(authorized.getSpec().unsignedTx)}`,
+        { cause: e },
+      );
+    }
     return { envelope, spec, privateFee };
   }
 
@@ -2247,6 +2277,7 @@ export class OotleAccount implements WalletAccountApi {
       }
     }
     const unsignedTx = await resolveTransaction(provider, builder.buildUnsignedTransaction());
+    unsignedTx.inputs = dedupeInputs(unsignedTx.inputs);
 
     // The redeemed input's one-time key co-signs the same way the fee input's does inside
     // `buildPrivateFeeInstructions` -- see this method's own doc comment for why no ordinary
@@ -3190,6 +3221,7 @@ export class OotleAccount implements WalletAccountApi {
       unsignedBody.is_seal_signer_authorized = true;
       unsignedBody.dry_run = dryRun;
       const unsignedTx = await resolveTransaction(provider, unsignedBody);
+      unsignedTx.inputs = dedupeInputs(unsignedTx.inputs);
       const signers: Signer[] = inputs.map((input) => ({
         getAddress: async () => walletAddress,
         getPublicKey: async () => parseOotleAddress(walletAddress).owner_key,
@@ -3292,6 +3324,7 @@ export class OotleAccount implements WalletAccountApi {
       unsignedBody.is_seal_signer_authorized = true;
       unsignedBody.dry_run = dryRun;
       const unsignedTx = await resolveTransaction(provider, unsignedBody);
+      unsignedTx.inputs = dedupeInputs(unsignedTx.inputs);
       const signed = await signTransaction([], unsignedTx, sealKeypair);
       return { envelope: sealTransaction(signed), claimedAmount, ownCommitment };
     };
@@ -3693,6 +3726,7 @@ async function buildHtlcSpendEnvelope(params: {
   const unsigned = builder.buildUnsignedTransaction();
   unsigned.dry_run = params.dryRun;
   const unsignedTx = await resolveTransaction(params.provider, unsigned);
+  unsignedTx.inputs = dedupeInputs(unsignedTx.inputs);
   const extraSigners = params.privateFee ? [params.privateFee.feeSigner] : [];
   const signed = await signTransaction([params.signer, ...extraSigners], unsignedTx);
   return sealTransaction(signed);
@@ -4071,6 +4105,31 @@ async function applyKnownVersions(inputs: SubstateRequirement[]): Promise<Substa
     const version = known.get(input.substate_id);
     return version !== undefined && (input.version === null || version > input.version) ? { ...input, version } : input;
   });
+}
+
+/**
+ * Collapses a transaction's inputs to one entry per `substate_id`. Ootle 0.47's transaction
+ * deserializer rejects duplicate inputs outright — the whole transaction fails to parse inside the
+ * signer wasm with the generic "data did not match any variant of untagged enum TransactionInput"
+ * (older wasm silently tolerated them). The SDK assembles inputs from several independent sources
+ * (an operation's own resource/account/vaults, a private fee's resource + fee UTXO, caller-supplied
+ * `relatedComponents` and their vaults), which legitimately overlap — above all when the fee is
+ * paid in the *same* resource being transacted (an XTR fee on an XTR shield), so that resource is
+ * added once by the operation and again by `buildPrivateFeeInstructions`. A write requirement
+ * subsumes a read; a concrete version is kept over a null one.
+ */
+export function dedupeInputs<T extends SubstateRequirement>(inputs: readonly T[]): T[] {
+  const byId = new Map<string, T>();
+  for (const input of inputs) {
+    const existing = byId.get(input.substate_id);
+    if (!existing) {
+      byId.set(input.substate_id, { ...input });
+      continue;
+    }
+    if ((input as { is_write?: boolean }).is_write) (existing as { is_write?: boolean }).is_write = true;
+    if (existing.version === null && input.version !== null) existing.version = input.version;
+  }
+  return [...byId.values()];
 }
 
 /** Remembers the post-transaction version of every substate a *confirmed* (never a dry-run —

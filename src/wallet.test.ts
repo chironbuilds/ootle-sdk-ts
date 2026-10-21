@@ -18,6 +18,7 @@ import {
   substateExists,
   summarizePrivateHoldings,
   synthesizeShieldedOnlyBalances,
+  dedupeInputs,
 } from "./wallet";
 
 function fakeRecord(overrides: Partial<ShieldedOutputRecord> = {}): ShieldedOutputRecord {
@@ -603,5 +604,49 @@ describe("transactionOutcome", () => {
   });
   it("treats an entry with no outcome yet as pending", () => {
     expect(transactionOutcome({ rejected_reason: null, summary: null })).toBe("pending");
+  });
+});
+
+describe("dedupeInputs (0.47 rejects duplicate transaction inputs)", () => {
+  // A private fee paid in the same resource an operation spends adds that resource as an input
+  // twice (once by the operation, once by buildPrivateFeeInstructions). Ootle 0.47's wasm rejects
+  // the whole transaction then ("data did not match any variant of untagged enum TransactionInput"),
+  // so inputs are collapsed to one entry per substate_id before signing.
+  const res = "resource_" + "01".repeat(32);
+  const acct = "component_" + "02".repeat(32);
+
+  it("collapses a repeated substate_id to a single entry, order preserved", () => {
+    const out = dedupeInputs([
+      { substate_id: res, version: 0, is_write: true },
+      { substate_id: res, version: 0, is_write: true },
+      { substate_id: acct, version: 1, is_write: true },
+    ]);
+    expect(out.map((i) => i.substate_id)).toEqual([res, acct]);
+  });
+
+  it("merges a write requirement over a read one", () => {
+    const out = dedupeInputs([
+      { substate_id: res, version: null, is_write: false },
+      { substate_id: res, version: null, is_write: true },
+    ]);
+    expect(out).toHaveLength(1);
+    expect((out[0] as { is_write?: boolean }).is_write).toBe(true);
+  });
+
+  it("keeps a concrete version over a null one", () => {
+    const out = dedupeInputs([
+      { substate_id: res, version: null },
+      { substate_id: res, version: 4 },
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0]!.version).toBe(4);
+  });
+
+  it("leaves an already-unique input list unchanged", () => {
+    const inputs = [
+      { substate_id: res, version: 0, is_write: true },
+      { substate_id: acct, version: 1, is_write: true },
+    ];
+    expect(dedupeInputs(inputs)).toEqual(inputs);
   });
 });
