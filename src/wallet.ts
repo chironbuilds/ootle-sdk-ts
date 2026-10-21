@@ -1180,8 +1180,11 @@ export class OotleAccount implements WalletAccountApi {
   ): Promise<{ publicKey: string; publicNonce: string; signature: string }> {
     const provider = await this.getProvider();
     const response = await provider.getSubstate(substateId);
-    const substate = response.state as unknown as { Utxo?: { output: { output: OutputBody; auth: { Key?: string } } | null } };
-    const utxo = substate.Utxo;
+    // Ootle 0.47 nests the Utxo under `state.up.substate` (older responses carried it as
+    // `substate` directly) -- `utxoOf` reads either, same as every other substate reader here.
+    // Before this, the hard-coded `response.state.Utxo` read `undefined` on 0.47, so every
+    // ownership proof wrongly threw "This output doesn't exist".
+    const utxo = utxoOf(response) as unknown as { output: { output: OutputBody; auth: { Key?: string } } | null } | undefined;
     if (!utxo?.output) {
       throw new Error("This output doesn't exist, isn't a stealth output, or has already been spent.");
     }
