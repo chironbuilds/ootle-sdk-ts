@@ -1364,8 +1364,8 @@ export class OotleAccount implements WalletAccountApi {
    * it in the same transaction.
    *
    * @param relatedComponents Every *other* component `followUpInstructions` touches (e.g. a
-   *   DAO contract being called). The `StealthTransfer` builder auto-registers this account's
-   *   own vaults as tx inputs, but has no way to know what the caller's own follow-up
+   *   DAO contract being called). This account's own vaults are registered as tx inputs
+   *   below, but the builder has no way to know what the caller's own follow-up
    *   instructions reference — the engine rejects a `CallMethod` touching an unregistered
    *   substate with `SubstateNotFound`. Each is registered by address, plus every vault its own
    *   state references (the same vault-discovery this account's own address already gets).
@@ -1407,6 +1407,11 @@ export class OotleAccount implements WalletAccountApi {
       // signed with the account key — see `accountPublicKey`'s own doc comment (tari-ootle#2645).
       .withRevealedReceiver(this.accountPublicKey)
       .andThen(followUpInstructions);
+    // `spendRevealedInput` withdraws from this account's vault but doesn't register it as an input
+    // (only the account component), so the engine rejects the withdraw with `vault_… not found`.
+    for (const vaultId of await getVaultIdsForAccount(provider, account)) {
+      builder = builder.withBuilder((b: any) => b.addInput({ substate_id: vaultId, version: null }));
+    }
     for (const component of relatedComponents) {
       builder = builder.withBuilder((b: any) => b.addInput({ substate_id: component, version: null }));
       for (const vaultId of await getVaultIdsForAccount(provider, component)) {
