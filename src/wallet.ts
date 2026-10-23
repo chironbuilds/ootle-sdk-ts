@@ -1291,6 +1291,13 @@ export class OotleAccount implements WalletAccountApi {
         return await this.unshieldIntoNewAccount(provider, resourceAddress, revealedOutAmount, commitments, remainder, maxFee, memo);
       }
 
+      // The dust below is withdrawn from this account's public vault for the resource. An account that only
+      // ever received this resource privately has no such vault, and the withdraw would be rejected
+      // ("No vault for resource ...") after the fee was already charged.
+      if (!(await this.hasPublicVault(provider, account, resourceAddress))) {
+        return await this.unshieldWithoutVault(provider, account, resourceAddress, revealedOutAmount, commitments, remainder, maxFee, memo, feeType, accountId);
+      }
+
       // See shield()'s comment: the resource's own substate must be pinned explicitly -- prepare()
       // never adds it on its own.
       let builder = new StealthTransfer(provider, resourceAddress)
@@ -3117,6 +3124,130 @@ export class OotleAccount implements WalletAccountApi {
   async estimateClaimBurnFee(contents: BurnClaimProofContents, memo = "Burnt funds claimed from L1"): Promise<bigint> {
     const { buildClaim, value } = await this.prepareBurnClaim(contents, memo);
     return this.estimateClaimFee(await buildClaim(claimFeeProbe(value), true));
+  }
+
+  /** Whether `account` holds a public vault for `resourceAddress` (a private-only holding has none). */
+  private async hasPublicVault(provider: IndexerProvider, account: string, resourceAddress: string): Promise<boolean> {
+    const vaultIds = await getVaultIdsForAccount(provider, account);
+    if (vaultIds.length === 0) return false;
+    const { substates } = await withTimeout(provider.fetchSubstates(vaultIds), 15_000, "checking this account's vaults");
+    for (const id of vaultIds) {
+      const value = substates[id]?.substate;
+      if (!value || !("Vault" in value)) continue;
+      const [, data] = Object.entries(value.Vault.resource_container)[0] as [string, Record<string, unknown>];
+      if (data.address === resourceAddress) return true;
+    }
+    return false;
+  }
+
+  /**
+   * `unshield()` for an existing account that has no public vault for this resource, so the usual
+   * dust withdrawal can't work. The stealth inputs reveal `amount` straight into a workspace bucket
+   * and `deposit` puts it in the account, which creates the vault. The account key is the seal
+   * signer (so it authorizes both the revealed output and the fee) and the fee comes from the
+   * account's public vault as in any other transparent transaction.
+   */
+  private async unshieldWithoutVault(
+    provider: IndexerProvider,
+    account: string,
+    resourceAddress: string,
+    amount: bigint,
+    commitments: string[],
+    remainder: bigint,
+    maxFee: bigint,
+    memo: string | undefined,
+    feeType: FeeType,
+    accountId: string
+  ): Promise<{ transactionId: string }> {
+    if (feeType.kind === "private") {
+      throw new Error(
+        "unshield: this account holds no public " +
+          "vault for the resource, so the first unshield has to pay its fee publicly. Use a transparent fee."
+      );
+    }
+    const crypto = new WasmStealthCrypto(this.network);
+    const viewSecret = await this.signer.getViewSecret();
+    const walletAddress = await this.getWalletAddress();
+    const ownerPublicKey = this.accountPublicKey;
+
+    const inputs = await Promise.all(
+      commitments.map(async (commitmentHex) => {
+        const substateId = stealthUtxoSubstateId(resourceAddress, fromHex(commitmentHex));
+        const substate = await provider.getSubstate(substateId);
+        const decrypted = await decryptOwnedUtxo(crypto, viewSecret, substate, substateId);
+        if (!decrypted) throw new Error(`unshield: cannot decrypt ${substateId} -- it isn't this account's, or it is already spent.`);
+        const nonce = utxoOf(substate).output.output.public_nonce;
+        return { commitmentHex, substateId, mask: decrypted.mask, nonce };
+      })
+    );
+    const inputMask = await crypto.aggregateInputMasks(inputs.map((i) => i.mask));
+    const inputsJson = JSON.stringify({
+      inputs: inputs.map((i) => ({ commitment: i.commitmentHex, witness: "KeyPath" })),
+      revealed_amount: "0",
+    });
+
+    const output = createOutput({ destination: walletAddress, amount: remainder, resourceAddress, memo: toMemo(memo) });
+    const { statement: outputsStatement, outputMask } = await crypto.generateOutputsStatement([output], { amount, receiver: ownerPublicKey });
+    const inputsStatement = new StealthInputsStatement([], 0n, inputsJson);
+    const balanceProof = await crypto.generateBalanceProofSignature(inputMask, outputMask, inputsJson, outputsStatement.statementJson);
+    const statement = new StealthTransferStatement(inputsStatement, outputsStatement, balanceProof);
+    await crypto.validateTransfer(statement);
+    const changeCommitment = (outputsStatement.parsed() as { outputs: { output: { commitment: string } }[] }).outputs[0]!.output.commitment;
+
+    const builder = TransactionBuilder.new(this.network, await resolveMaxEpoch(provider))
+      .addInstruction({
+        StealthTransfer: {
+          resource_address_ref: { Address: resourceAddress },
+          statement: { __ootleRawJson: statement.toCompactJson() },
+          revealed_input_bucket: null,
+        },
+      } as unknown as Instruction)
+      .addInstruction({ PutLastInstructionOutputOnWorkspace: { key: 0 } } as unknown as Instruction)
+      .addInstruction({
+        CallMethod: { call: { Address: account }, method: "deposit", args: [{ Workspace: { id: 0, offset: null } }] },
+      } as unknown as Instruction);
+    builder.feeTransactionPayFromComponent(account, maxFee);
+    builder
+      .addInput({ substate_id: resourceAddress, version: null })
+      .addInput({ substate_id: account, version: null });
+    for (const vaultId of await getVaultIdsForAccount(provider, account)) {
+      builder.addInput({ substate_id: vaultId, version: null });
+    }
+    for (const input of inputs) builder.addInput({ substate_id: input.substateId, version: null });
+    const unsignedBody = builder.buildUnsignedTransaction();
+    unsignedBody.is_seal_signer_authorized = true;
+    const unsignedTx = await resolveTransaction(provider, unsignedBody);
+    unsignedTx.inputs = dedupeInputs(unsignedTx.inputs);
+
+    const signers: Signer[] = inputs.map((input) => ({
+      getAddress: async () => walletAddress,
+      getPublicKey: async () => parseOotleAddress(walletAddress).owner_key,
+      signTransaction: async (tx: UnsignedTransactionWithBlobs, sealPublicKey: Uint8Array) => {
+        const json = serializeUnsignedTx(tx);
+        return [await this.signer.addStealthSignature!(json, fromHex(input.nonce), sealPublicKey, { crypto })];
+      },
+    }));
+    const signed = await signTransaction(signers, unsignedTx, { secret_key: this.ownerSecret, public_key: ownerPublicKey });
+    const transactionId = await submitTransaction(provider, sealTransaction(signed));
+
+    await addPendingShield({
+      transactionId,
+      accountId,
+      resourceAddress,
+      amount: remainder.toString(),
+      spentCommitments: commitments,
+      ownCommitment: changeCommitment,
+      memo,
+    });
+    try {
+      const response = await withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the unshield transaction");
+      await recordKnownVersions(response);
+      await recordKnownShieldedOutput(accountId, resourceAddress, changeCommitment, remainder, transactionId, memo);
+      for (const commitment of commitments) await markShieldedOutputSpent(accountId, commitment);
+    } finally {
+      await removePendingShield(transactionId);
+    }
+    return { transactionId };
   }
 
   /**
