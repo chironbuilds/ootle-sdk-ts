@@ -95,9 +95,13 @@ import { type NetworkName, toOotleNetwork } from "./ootleNetwork.js";
 import {
   addPendingShield,
   addShieldedOutput,
+  clearUtxoScanPageCursor,
   getHtlcJournalEntry,
   getKnownVersions,
   getPrivatePaymentScanCursor,
+  getPrivatePaymentScanResume,
+  getUtxoScanPageCursor,
+  getUtxoScanWatermarks,
   listHtlcJournal,
   listPendingShields,
   listReservedCommitments,
@@ -110,11 +114,16 @@ import {
   reserveCommitments,
   setKnownVersions,
   setPrivatePaymentScanCursor,
+  setPrivatePaymentScanResume,
+  setUtxoScanPageCursor,
+  setUtxoScanWatermarks,
   updateHtlcJournalEntry,
   CommitmentReservedError,
 } from "./storage.js";
-import type { HtlcJournalEntry, ShieldedOutputRecord } from "./storage.js";
+import type { HtlcJournalEntry, PrivatePaymentScanResume, ShieldedOutputRecord } from "./storage.js";
 import { withTimeout } from "./timeout.js";
+import { scanUtxosDelta, scanUtxosPage } from "./utxoScan.js";
+import type { UtxoScanWatermark } from "./utxoScan.js";
 import { fromHex, toHex } from "./vault.js";
 
 /** How a transaction's fee is paid. Defaults to `transparent` everywhere (unchanged behavior:
@@ -342,6 +351,27 @@ function fromMemo(memoJson: string | undefined): string | undefined {
  * One derived Ootle account: a signer (owner + view keypair) plus the network connection needed
  * to read its state and submit transactions, entirely independent of the wallet daemon.
  */
+/**
+ * What a private-payment scan pass should persist once it stops: the cursor only advances when the
+ * pass completed (reached the old cursor, or the end of history) with no not-yet-finalized
+ * transaction behind it; a pass that ran out of pages instead saves where to continue. `resume`
+ * is `null` to clear it, `undefined` to leave it alone. Exported for tests.
+ */
+export function settlePrivatePaymentScan(pass: {
+  reachedCursor: boolean;
+  newestSeen: string | null;
+  lastId: string | null;
+  pendingSeen: boolean;
+}): { cursor?: string; resume?: PrivatePaymentScanResume | null } {
+  if (pass.reachedCursor) {
+    return { cursor: pass.newestSeen && !pass.pendingSeen ? pass.newestSeen : undefined, resume: null };
+  }
+  if (pass.newestSeen && pass.lastId) {
+    return { resume: { newest: pass.newestSeen, lastId: pass.lastId, pending: pass.pendingSeen } };
+  }
+  return {};
+}
+
 export class OotleAccount implements WalletAccountApi {
   readonly index: number;
   readonly network: Network;
@@ -3550,8 +3580,16 @@ export class OotleAccount implements WalletAccountApi {
    * `buildStatus()`'s `recoverPendingShields()` call for the same pattern. Walks backward in pages
    * of `pageSize` (oldest-paging via `last_id`, per the indexer's own "recent" convention) up to
    * `maxPages`, stopping early once it reaches the transaction id it left off at last time. A very
-   * active chain producing more than `maxPages * pageSize` new transactions between scans will
-   * only be caught up partway; the next scan resumes from the same cursor and continues.
+   * active chain producing more than `maxPages * pageSize` new transactions between scans is caught
+   * up over several scans: a pass that runs out of pages saves where it stopped
+   * (`privatePaymentScanResumes`), and the next one continues backward from there instead of
+   * restarting at the newest transaction -- which, with the page budget the opportunistic scan
+   * uses, would otherwise re-scan the same newest pages forever and never reach the older gap. The
+   * cursor only advances once a catch-up completes.
+   *
+   * Limit: this reads transaction *bodies*, which an indexer prunes after its
+   * `transaction_retention_epochs` (50 by default, roughly 3-6 days on Esmeralda). A gap older than
+   * that is gone from the listing and cannot be recovered by this scan.
    */
   async scanForPrivatePayments(maxPages?: number, pageSize = 50): Promise<{ claimed: number; found: ScannedStealthOutput[] }> {
     const accountId = localAccountId(this.index);
@@ -3562,8 +3600,11 @@ export class OotleAccount implements WalletAccountApi {
     const knownCommitments = new Set(known.map((r) => r.commitment));
 
     const previousCursor = await getPrivatePaymentScanCursor(accountId);
-    let newestSeen: string | null = null;
-    let lastId: string | null = null;
+    // An earlier pass that ran out of pages: carry on from where it stopped, with the newest id and
+    // pending flag it captured when it began (see the method doc comment).
+    let resume = await getPrivatePaymentScanResume(accountId);
+    let newestSeen: string | null = resume?.newest ?? null;
+    let lastId: string | null = resume?.lastId ?? null;
     const found: ScannedStealthOutput[] = [];
     // Whether this pass actually walked all the way back to `previousCursor` (or there was none to
     // reach -- the very first scan ever). Only true in that case is it safe to advance the cursor:
@@ -3580,15 +3621,29 @@ export class OotleAccount implements WalletAccountApi {
     const isFirstScan = previousCursor === null;
     const pageBudget = maxPages ?? (isFirstScan ? 400 : 3);
     let reachedCursor = false;
-    let pendingSeen = false;
+    let pendingSeen = resume?.pending ?? false;
 
     pages: for (let page = 0; page < pageBudget; page++) {
-      const { transactions } = await provider.listRecentTransactions({ limit: pageSize, last_id: lastId, source: null });
+      let transactions;
+      try {
+        ({ transactions } = await provider.listRecentTransactions({ limit: pageSize, last_id: lastId, source: null }));
+      } catch (e) {
+        // The saved resume point can name a transaction the indexer has pruned since, which it may
+        // refuse as a page anchor. That part of the gap is unreachable anyway: drop the resume point
+        // and start over from the newest so the scan cannot be stuck failing on it forever.
+        if (page !== 0 || !resume) throw e;
+        await setPrivatePaymentScanResume(accountId, null);
+        resume = null;
+        newestSeen = null;
+        lastId = null;
+        pendingSeen = false;
+        ({ transactions } = await provider.listRecentTransactions({ limit: pageSize, last_id: null, source: null }));
+      }
       if (transactions.length === 0) {
         reachedCursor = true; // the indexer's whole history fit before ever finding previousCursor
         break;
       }
-      if (page === 0) newestSeen = transactions[0]!.transaction_id;
+      if (newestSeen === null) newestSeen = transactions[0]!.transaction_id;
 
       for (const entry of transactions) {
         if (entry.transaction_id === previousCursor) {
@@ -3624,7 +3679,9 @@ export class OotleAccount implements WalletAccountApi {
       lastId = transactions[transactions.length - 1]!.transaction_id;
     }
 
-    if (newestSeen && reachedCursor && !pendingSeen) await setPrivatePaymentScanCursor(accountId, newestSeen);
+    const outcome = settlePrivatePaymentScan({ reachedCursor, newestSeen, lastId, pendingSeen });
+    if (outcome.cursor) await setPrivatePaymentScanCursor(accountId, outcome.cursor);
+    if (outcome.resume !== undefined) await setPrivatePaymentScanResume(accountId, outcome.resume);
     return { claimed: found.length, found };
   }
 
@@ -3735,6 +3792,93 @@ export class OotleAccount implements WalletAccountApi {
       lastId = transactions[transactions.length - 1]!.transaction_id;
     }
     return found;
+  }
+
+  /**
+   * Scans the live UTXO set for outputs owned by this account, without replaying transaction
+   * history.  This is complementary to `scanForPrivatePayments()` (transaction-history scan) and
+   * `scanForResourceUtxos()` (transaction-result walk): it queries the indexer's current UTXO set
+   * directly, so it finds any output that exists on-chain right now regardless of how old it is or
+   * how it was created.
+   *
+   * **Incremental mode (default):** Uses the indexer's delta streaming endpoint
+   * (`POST /utxos/stream`).  The first call with no prior state replays everything the indexer
+   * has retained; subsequent calls with saved watermarks return only the delta since then.  Also
+   * marks known outputs as spent when the chain reports they were consumed.  Call repeatedly
+   * until `newOutputs` stabilises to 0.
+   *
+   * **Full paginated mode** (`mode: "full"`): Pages through the entire live UTXO set ordered by
+   * commitment id.  Use when watermarks are lost or a complete re-scan is needed.  More expensive
+   * than incremental for large resources; for new ones the two modes are equivalent.
+   *
+   * In both modes the scan saves its checkpoint automatically and resumes from there on the next
+   * call, so a mid-scan crash loses at most one batch.
+   *
+   * @param resourceAddress - The resource whose UTXOs to scan (hex, no "resource_" prefix needed).
+   * @param indexerBaseUrl  - The indexer's REST base URL (the same one passed to
+   *                          `IndexerProvider.connect({ url: ... })`).
+   * @param opts.mode       - `"delta"` (default) for incremental, `"full"` for a paginated sweep.
+   * @param opts.perShardLimit - Max updates per shard per delta call (default 200).
+   * @param opts.pageSize   - Page size for full-scan mode (default 100).
+   * @returns Number of newly found outputs and newly marked-spent outputs.
+   */
+  async scanForOwnedUtxos(
+    resourceAddress: string,
+    indexerBaseUrl: string,
+    opts: { mode?: "delta" | "full"; perShardLimit?: number; pageSize?: number } = {},
+  ): Promise<{ newOutputs: number; markedSpent: number }> {
+    const { mode = "delta", perShardLimit = 200, pageSize = 100 } = opts;
+    const accountId = localAccountId(this.index);
+    const viewSecret = await this.signer.getViewSecret();
+    const crypto = new WasmStealthCrypto(this.network);
+    let newOutputs = 0;
+    let markedSpent = 0;
+
+    const recordOutput = async (raw: { resourceAddress: string; commitment: string; amount: bigint; transactionId: string; memo?: string }): Promise<void> => {
+      await addShieldedOutput({
+        accountId,
+        resourceAddress: raw.resourceAddress,
+        commitment: raw.commitment,
+        amount: raw.amount.toString(),
+        transactionId: raw.transactionId,
+        memo: raw.memo,
+        createdAt: Date.now(),
+        spent: false,
+      });
+      newOutputs++;
+    };
+
+    if (mode === "delta") {
+      let watermarks: UtxoScanWatermark = await getUtxoScanWatermarks(accountId, resourceAddress);
+      let hasMore = true;
+      while (hasMore) {
+        const result = await scanUtxosDelta(indexerBaseUrl, resourceAddress, crypto, viewSecret, watermarks, perShardLimit);
+        for (const output of result.owned) await recordOutput(output);
+        for (const commitment of result.spentCommitments) {
+          await markShieldedOutputSpent(accountId, commitment);
+          markedSpent++;
+        }
+        watermarks = result.watermarks;
+        await setUtxoScanWatermarks(accountId, resourceAddress, watermarks);
+        hasMore = result.hasMore;
+      }
+    } else {
+      let cursor = await getUtxoScanPageCursor(accountId, resourceAddress);
+      let morePages = true;
+      while (morePages) {
+        const result = await scanUtxosPage(indexerBaseUrl, resourceAddress, crypto, viewSecret, cursor, pageSize);
+        for (const output of result.owned) await recordOutput(output);
+        if (result.nextCursor) {
+          cursor = result.nextCursor;
+          await setUtxoScanPageCursor(accountId, resourceAddress, cursor);
+        } else {
+          await clearUtxoScanPageCursor(accountId, resourceAddress);
+          morePages = false;
+        }
+      }
+    }
+
+    return { newOutputs, markedSpent };
   }
 }
 

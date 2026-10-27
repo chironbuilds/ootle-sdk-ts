@@ -19,6 +19,7 @@ import {
   summarizePrivateHoldings,
   synthesizeShieldedOnlyBalances,
   dedupeInputs,
+  settlePrivatePaymentScan,
 } from "./wallet";
 
 function fakeRecord(overrides: Partial<ShieldedOutputRecord> = {}): ShieldedOutputRecord {
@@ -648,5 +649,25 @@ describe("dedupeInputs (0.47 rejects duplicate transaction inputs)", () => {
       { substate_id: acct, version: 1, is_write: true },
     ];
     expect(dedupeInputs(inputs)).toEqual(inputs);
+  });
+});
+
+describe("settlePrivatePaymentScan", () => {
+  it("advances the cursor and clears the resume point when a pass completes", () => {
+    expect(settlePrivatePaymentScan({ reachedCursor: true, newestSeen: "tx-9", lastId: "tx-3", pendingSeen: false })).toEqual({ cursor: "tx-9", resume: null });
+  });
+
+  it("keeps the old cursor, but still clears the resume point, when a pending transaction was seen", () => {
+    expect(settlePrivatePaymentScan({ reachedCursor: true, newestSeen: "tx-9", lastId: "tx-3", pendingSeen: true })).toEqual({ cursor: undefined, resume: null });
+  });
+
+  it("saves where to continue, and leaves the cursor alone, when a pass runs out of pages", () => {
+    expect(settlePrivatePaymentScan({ reachedCursor: false, newestSeen: "tx-9", lastId: "tx-5", pendingSeen: true })).toEqual({
+      resume: { newest: "tx-9", lastId: "tx-5", pending: true },
+    });
+  });
+
+  it("persists nothing when a pass saw no transactions at all", () => {
+    expect(settlePrivatePaymentScan({ reachedCursor: false, newestSeen: null, lastId: null, pendingSeen: false })).toEqual({});
   });
 });

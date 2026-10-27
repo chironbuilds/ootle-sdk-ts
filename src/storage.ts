@@ -133,23 +133,45 @@ export interface CommitmentReservation {
   expiresAt: number;
 }
 
+/** Where an unfinished private-payment catch-up left off, so the next scan continues backward from
+ * there instead of restarting at the newest transaction and never reaching the older part of a long gap. */
+export interface PrivatePaymentScanResume {
+  /** Newest transaction id when the catch-up began; becomes the cursor once it completes. */
+  newest: string;
+  /** The last transaction id of the last page scanned -- the next page starts after it. */
+  lastId: string;
+  /** A not-yet-finalized transaction was seen, so the cursor must not advance when this completes. */
+  pending: boolean;
+}
+
 interface OotleState {
   shieldedOutputs: ShieldedOutputRecord[];
   pendingShields: PendingShield[];
   privatePaymentScanCursors: Record<string, string>;
+  privatePaymentScanResumes: Record<string, PrivatePaymentScanResume>;
   /** Substate versions already seen, so a resubmission does not re-lock a stale version. */
   knownVersions: Record<string, number>;
   htlcJournal: HtlcJournalEntry[];
   reservations: CommitmentReservation[];
+  /** UTXO-set delta scan checkpoints: `${accountId}:${resourceAddress}` → shard watermarks.
+   * Persisted after every `scanUtxosDelta` call so the next call resumes without re-scanning.
+   * Element type: [Shard (u32), StateVersion (number | bigint | string)] */
+  utxoScanWatermarks: Record<string, Array<[number, number | string | bigint]>>;
+  /** Paginated full-scan cursors: `${accountId}:${resourceAddress}` → last UtxoId seen.
+   * Only set while a full paginated scan is in progress; cleared when the last page is reached. */
+  utxoScanPageCursors: Record<string, string>;
 }
 
 const DEFAULTS: OotleState = {
   shieldedOutputs: [],
   pendingShields: [],
   privatePaymentScanCursors: {},
+  privatePaymentScanResumes: {},
   knownVersions: {},
   htlcJournal: [],
   reservations: [],
+  utxoScanWatermarks: {},
+  utxoScanPageCursors: {},
 };
 
 export function localAccountId(index: number): string {
@@ -261,6 +283,19 @@ export async function setPrivatePaymentScanCursor(accountId: string, transaction
   });
 }
 
+export async function getPrivatePaymentScanResume(accountId: string): Promise<PrivatePaymentScanResume | null> {
+  return (await read()).privatePaymentScanResumes[accountId] ?? null;
+}
+
+/** Saves where a partial catch-up stopped, or clears it with `null`. */
+export async function setPrivatePaymentScanResume(accountId: string, resume: PrivatePaymentScanResume | null): Promise<void> {
+  await serialized(async () => {
+    const state = await read();
+    const { [accountId]: _dropped, ...rest } = state.privatePaymentScanResumes;
+    await write({ privatePaymentScanResumes: resume ? { ...rest, [accountId]: resume } : rest });
+  });
+}
+
 /** Substate version cache -- see `wallet.ts`'s own doc comment on `knownVersionsPromise` for why
  * this exists at all. */
 export async function getKnownVersions(): Promise<Record<string, number>> {
@@ -363,6 +398,46 @@ export class CommitmentReservedError extends Error {
     );
     this.name = "CommitmentReservedError";
   }
+}
+
+// ── UTXO set scan checkpoints ────────────────────────────────────────────────────────────────────
+
+function utxoKey(accountId: string, resourceAddress: string): string {
+  return `${accountId}:${resourceAddress}`;
+}
+
+/** Returns the shard watermarks last saved for `accountId` + `resourceAddress`, or `[]` if
+ * this resource has never been scanned (which signals the indexer to replay everything). */
+export async function getUtxoScanWatermarks(accountId: string, resourceAddress: string): Promise<Array<[number, number | string | bigint]>> {
+  return (await read()).utxoScanWatermarks[utxoKey(accountId, resourceAddress)] ?? [];
+}
+
+export async function setUtxoScanWatermarks(accountId: string, resourceAddress: string, watermarks: Array<[number, number | string | bigint]>): Promise<void> {
+  await serialized(async () => {
+    const state = await read();
+    await write({ utxoScanWatermarks: { ...state.utxoScanWatermarks, [utxoKey(accountId, resourceAddress)]: watermarks } });
+  });
+}
+
+/** Returns the last UtxoId (commitment hex) seen during a paginated full scan, or `null` if
+ * no full scan is in progress for this resource. */
+export async function getUtxoScanPageCursor(accountId: string, resourceAddress: string): Promise<string | null> {
+  return (await read()).utxoScanPageCursors[utxoKey(accountId, resourceAddress)] ?? null;
+}
+
+export async function setUtxoScanPageCursor(accountId: string, resourceAddress: string, cursor: string): Promise<void> {
+  await serialized(async () => {
+    const state = await read();
+    await write({ utxoScanPageCursors: { ...state.utxoScanPageCursors, [utxoKey(accountId, resourceAddress)]: cursor } });
+  });
+}
+
+export async function clearUtxoScanPageCursor(accountId: string, resourceAddress: string): Promise<void> {
+  await serialized(async () => {
+    const state = await read();
+    const { [utxoKey(accountId, resourceAddress)]: _dropped, ...rest } = state.utxoScanPageCursors;
+    await write({ utxoScanPageCursors: rest });
+  });
 }
 
 /** Clears every key this module owns -- call this from a host's own "erase wallet" flow. Does not

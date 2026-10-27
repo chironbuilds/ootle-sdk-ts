@@ -48,13 +48,17 @@ export { decryptVault, encryptVault, fromHex, toHex } from "./vault.js";
 
 export { withTimeout } from "./timeout.js";
 
-export type { CommitmentReservation, HtlcJournalEntry, HtlcJournalStatus, KeyValueStore, PendingShield, ShieldedOutputRecord } from "./storage.js";
+export type { CommitmentReservation, HtlcJournalEntry, HtlcJournalStatus, KeyValueStore, PendingShield, PrivatePaymentScanResume, ShieldedOutputRecord } from "./storage.js";
 export {
   addPendingShield,
   addShieldedOutput,
+  clearUtxoScanPageCursor,
   configureOotleStorage,
   getKnownVersions,
   getPrivatePaymentScanCursor,
+  getPrivatePaymentScanResume,
+  getUtxoScanPageCursor,
+  getUtxoScanWatermarks,
   listPendingShields,
   listShieldedOutputs,
   localAccountId,
@@ -63,11 +67,17 @@ export {
   serialized,
   setKnownVersions,
   setPrivatePaymentScanCursor,
+  setPrivatePaymentScanResume,
+  setUtxoScanPageCursor,
+  setUtxoScanWatermarks,
   wipeOotleState,
   CommitmentReservedError,
   RESERVATION_TTL_MS,
   listHtlcJournal,
 } from "./storage.js";
+
+export type { UtxosDeltaResult, UtxosPageResult, UtxoScanWatermark } from "./utxoScan.js";
+export { scanUtxosDelta, scanUtxosPage } from "./utxoScan.js";
 
 export { chromeStorageAdapter, inMemoryAdapter, localStorageAdapter } from "./adapters.js";
 

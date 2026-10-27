@@ -6,6 +6,7 @@ import {
   configureOotleStorage,
   getKnownVersions,
   getPrivatePaymentScanCursor,
+  getPrivatePaymentScanResume,
   listPendingShields,
   listShieldedOutputs,
   markShieldedOutputSpent,
@@ -13,6 +14,7 @@ import {
   serialized,
   setKnownVersions,
   setPrivatePaymentScanCursor,
+  setPrivatePaymentScanResume,
   wipeOotleState,
   getHtlcJournalEntry,
   listHtlcJournal,
@@ -82,6 +84,18 @@ describe("storage (KeyValueStore-backed)", () => {
     expect(await getPrivatePaymentScanCursor("local:0")).toBeNull();
     await setPrivatePaymentScanCursor("local:0", "tx-42");
     expect(await getPrivatePaymentScanCursor("local:0")).toBe("tx-42");
+  });
+
+  it("saves, replaces and clears a scan resume point per account", async () => {
+    expect(await getPrivatePaymentScanResume("local:0")).toBeNull();
+    await setPrivatePaymentScanResume("local:0", { newest: "tx-9", lastId: "tx-5", pending: false });
+    await setPrivatePaymentScanResume("local:1", { newest: "tx-8", lastId: "tx-7", pending: true });
+    expect(await getPrivatePaymentScanResume("local:0")).toEqual({ newest: "tx-9", lastId: "tx-5", pending: false });
+    await setPrivatePaymentScanResume("local:0", { newest: "tx-9", lastId: "tx-2", pending: true });
+    expect(await getPrivatePaymentScanResume("local:0")).toEqual({ newest: "tx-9", lastId: "tx-2", pending: true });
+    await setPrivatePaymentScanResume("local:0", null);
+    expect(await getPrivatePaymentScanResume("local:0")).toBeNull();
+    expect(await getPrivatePaymentScanResume("local:1")).not.toBeNull();
   });
 
   it("round-trips known substate versions", async () => {
