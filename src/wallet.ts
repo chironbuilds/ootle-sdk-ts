@@ -3827,7 +3827,11 @@ export class OotleAccount implements WalletAccountApi {
     indexerBaseUrl: string,
     opts: { mode?: "delta" | "full"; perShardLimit?: number; pageSize?: number } = {},
   ): Promise<{ newOutputs: number; markedSpent: number }> {
-    const { mode = "delta", perShardLimit = 200, pageSize = 100 } = opts;
+    // "full" uses GET /utxos (paginated snapshot) which works on current indexers.
+    // "delta" uses POST /utxos/stream (live-push NDJSON) which is a watch stream,
+    // not a catch-up replay -- it returns an empty body on first call and is not
+    // suitable for historical scanning until the indexer supports replay mode.
+    const { mode = "full", perShardLimit = 200, pageSize = 100 } = opts;
     const accountId = localAccountId(this.index);
     const viewSecret = await this.signer.getViewSecret();
     const crypto = new WasmStealthCrypto(this.network);
