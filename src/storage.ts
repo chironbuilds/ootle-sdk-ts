@@ -47,6 +47,9 @@ export interface ShieldedOutputRecord {
   createdAt: number;
   /** Set true once this output has been spent via unshield. */
   spent: boolean;
+  /** Why `spent` was set: "local" = this wallet's own transaction spent it; "inferred" = only an
+   * indexer said it was gone, which `reviveShieldedOutput` may undo if it is seen live again. */
+  spentReason?: "local" | "inferred";
   /** The output's plaintext memo, if any. Absent, not empty-string, when it carries none. */
   memo?: string;
 }
@@ -242,14 +245,31 @@ export async function addShieldedOutput(record: ShieldedOutputRecord): Promise<v
   });
 }
 
-export async function markShieldedOutputSpent(accountId: string, commitment: string): Promise<void> {
+export async function markShieldedOutputSpent(accountId: string, commitment: string, reason: "local" | "inferred" = "local"): Promise<void> {
   await serialized(async () => {
     const state = await read();
     await write({
       shieldedOutputs: state.shieldedOutputs.map((r) =>
-        r.accountId === accountId && r.commitment === commitment ? { ...r, spent: true } : r,
+        r.accountId === accountId && r.commitment === commitment && !r.spent ? { ...r, spent: true, spentReason: reason } : r,
       ),
     });
+  });
+}
+
+/** Un-spends a record that was only *inferred* spent (an indexer said "not found") once the output
+ * is seen live again. A record this wallet spent itself is never revived. Returns whether it changed. */
+export async function reviveShieldedOutput(accountId: string, commitment: string): Promise<boolean> {
+  return serialized(async () => {
+    const state = await read();
+    let revived = false;
+    const shieldedOutputs = state.shieldedOutputs.map((r) => {
+      if (r.accountId !== accountId || r.commitment !== commitment || !r.spent || r.spentReason !== "inferred") return r;
+      revived = true;
+      const { spentReason: _drop, ...rest } = r;
+      return { ...rest, spent: false };
+    });
+    if (revived) await write({ shieldedOutputs });
+    return revived;
   });
 }
 

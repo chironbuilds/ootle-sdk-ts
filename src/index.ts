@@ -63,6 +63,7 @@ export {
   listShieldedOutputs,
   localAccountId,
   markShieldedOutputSpent,
+  reviveShieldedOutput,
   removePendingShield,
   serialized,
   setKnownVersions,

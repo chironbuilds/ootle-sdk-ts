@@ -10,6 +10,7 @@ import {
   listPendingShields,
   listShieldedOutputs,
   markShieldedOutputSpent,
+  reviveShieldedOutput,
   removePendingShield,
   serialized,
   setKnownVersions,
@@ -63,6 +64,28 @@ describe("storage (KeyValueStore-backed)", () => {
     const records = await listShieldedOutputs("local:0");
     expect(records.find((r) => r.commitment === "aa".repeat(32))?.spent).toBe(true);
     expect(records.find((r) => r.commitment === "bb".repeat(32))?.spent).toBe(false);
+  });
+
+  it("revives an output only an indexer said was spent, never one spent locally", async () => {
+    await addShieldedOutput(record({ commitment: "aa".repeat(32) }));
+    await addShieldedOutput(record({ commitment: "bb".repeat(32) }));
+    await markShieldedOutputSpent("local:0", "aa".repeat(32), "inferred");
+    await markShieldedOutputSpent("local:0", "bb".repeat(32));
+
+    expect(await reviveShieldedOutput("local:0", "aa".repeat(32))).toBe(true);
+    expect(await reviveShieldedOutput("local:0", "bb".repeat(32))).toBe(false);
+
+    const records = await listShieldedOutputs("local:0");
+    expect(records.find((r) => r.commitment === "aa".repeat(32))).toMatchObject({ spent: false });
+    expect(records.find((r) => r.commitment === "aa".repeat(32))?.spentReason).toBeUndefined();
+    expect(records.find((r) => r.commitment === "bb".repeat(32))).toMatchObject({ spent: true, spentReason: "local" });
+  });
+
+  it("keeps the first spend reason when an output is marked spent twice", async () => {
+    await addShieldedOutput(record());
+    await markShieldedOutputSpent("local:0", "aa".repeat(32));
+    await markShieldedOutputSpent("local:0", "aa".repeat(32), "inferred");
+    expect(await reviveShieldedOutput("local:0", "aa".repeat(32))).toBe(false);
   });
 
   it("dedupes a pending shield by transaction id", async () => {

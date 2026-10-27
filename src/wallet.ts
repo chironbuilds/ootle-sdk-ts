@@ -108,6 +108,7 @@ import {
   listShieldedOutputs,
   localAccountId,
   markShieldedOutputSpent,
+  reviveShieldedOutput,
   putHtlcJournalEntry,
   releaseReservations,
   removePendingShield,
@@ -897,6 +898,7 @@ export class OotleAccount implements WalletAccountApi {
    * already exists.
    */
   async send(recipientAddress: string, resourceAddress: string, amount: bigint, maxFee = 5000n, feeType: FeeType = { kind: "transparent" }) {
+    if (amount <= 0n) throw new Error(`send: amount must be greater than zero, got ${amount}`);
     const account = await this.getComponentAddress();
     const isWalletAddress = recipientAddress.startsWith("otl");
     const recipient = isWalletAddress ? componentAddressFromWalletAddress(recipientAddress) : recipientAddress;
@@ -1421,9 +1423,53 @@ export class OotleAccount implements WalletAccountApi {
     maxFee = 100000n,
     feeType: FeeType = { kind: "transparent" }
   ): Promise<{ transactionId: string }> {
-    if (amount <= 0n) throw new Error(`withdrawStealthAndExecute amount must be > 0, got ${amount}`);
     const provider = await this.getProvider();
     const account = await this.getComponentAddress();
+    const builder = await this.buildWithdrawStealthAndExecute(provider, account, resourceAddress, amount, workspaceVarName, followUpInstructions, relatedComponents);
+    const viewSecret = await this.signer.getViewSecret();
+    const { transactionId, privateFee } = await this.prepareSignSubmit(builder as unknown as StealthTransfer, provider, account, maxFee, feeType, { viewSecret });
+    const response = await withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the transaction");
+    await recordKnownVersions(response);
+    if (privateFee && feeType.kind === "private") {
+      await this.recordPrivateFeeSpend(localAccountId(this.index), feeType.feeResourceAddress, privateFee, transactionId);
+    }
+    return { transactionId };
+  }
+
+  /**
+   * Simulates exactly what `withdrawStealthAndExecute` would submit (transparent fee) against the
+   * indexer's dry-run endpoint and returns the execution result -- so a wallet can show what the
+   * follow-up instructions actually move before asking the user to approve. Spends nothing.
+   */
+  async dryRunWithdrawStealthAndExecute(
+    resourceAddress: string,
+    amount: bigint,
+    workspaceVarName: string,
+    followUpInstructions: Instruction[],
+    relatedComponents: string[] = [],
+    maxFee = 100000n
+  ): Promise<ExecuteResult> {
+    const provider = await this.getProvider();
+    const account = await this.getComponentAddress();
+    const builder = await this.buildWithdrawStealthAndExecute(provider, account, resourceAddress, amount, workspaceVarName, followUpInstructions, relatedComponents);
+    const viewSecret = await this.signer.getViewSecret();
+    const { envelope } = await this.sealStealthTransfer(builder as unknown as StealthTransfer, provider, account, maxFee, { kind: "transparent" }, {
+      authorizerOpts: { viewSecret },
+      dryRun: true,
+    });
+    return this.dryRunEnvelope(envelope);
+  }
+
+  private async buildWithdrawStealthAndExecute(
+    provider: IndexerProvider,
+    account: string,
+    resourceAddress: string,
+    amount: bigint,
+    workspaceVarName: string,
+    followUpInstructions: Instruction[],
+    relatedComponents: string[]
+  ) {
+    if (amount <= 0n) throw new Error(`withdrawStealthAndExecute amount must be > 0, got ${amount}`);
     const walletAddress = await this.getWalletAddress();
     // A zero-stealth-output StealthTransferStatement (pure revealed-in, revealed-out-as-bucket)
     // isn't a shape the bundled ootle-wasm@0.37.0 signer can parse -- confirmed live: it throws
@@ -1460,14 +1506,7 @@ export class OotleAccount implements WalletAccountApi {
         builder = builder.withBuilder((b: any) => b.addInput({ substate_id: vaultId, version: null }));
       }
     }
-    const viewSecret = await this.signer.getViewSecret();
-    const { transactionId, privateFee } = await this.prepareSignSubmit(builder as unknown as StealthTransfer, provider, account, maxFee, feeType, { viewSecret });
-    const response = await withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the transaction");
-    await recordKnownVersions(response);
-    if (privateFee && feeType.kind === "private") {
-      await this.recordPrivateFeeSpend(localAccountId(this.index), feeType.feeResourceAddress, privateFee, transactionId);
-    }
-    return { transactionId };
+    return builder;
   }
 
   /**
@@ -2093,7 +2132,7 @@ export class OotleAccount implements WalletAccountApi {
         if (!decrypted) unreadable.add(record.commitment); // doesn't decrypt as ours -- don't offer it either
       } catch (e) {
         unreadable.add(record.commitment);
-        if (isSpentElsewhere(record, e)) await markShieldedOutputSpent(accountId, record.commitment);
+        if (isSpentElsewhere(record, e)) await markShieldedOutputSpent(accountId, record.commitment, "inferred");
       }
     }
     return unreadable;
@@ -3670,7 +3709,7 @@ export class OotleAccount implements WalletAccountApi {
           await recordKnownShieldedOutput(accountId, output.resourceAddress, output.commitment, output.amount, output.transactionId, output.memo);
           knownCommitments.add(output.commitment);
           if (spentAlready) {
-            await markShieldedOutputSpent(accountId, output.commitment);
+            await markShieldedOutputSpent(accountId, output.commitment, "inferred");
             continue;
           }
           found.push(output);
@@ -3801,44 +3840,46 @@ export class OotleAccount implements WalletAccountApi {
    * directly, so it finds any output that exists on-chain right now regardless of how old it is or
    * how it was created.
    *
-   * **Incremental mode (default):** Uses the indexer's delta streaming endpoint
-   * (`POST /utxos/stream`).  The first call with no prior state replays everything the indexer
-   * has retained; subsequent calls with saved watermarks return only the delta since then.  Also
-   * marks known outputs as spent when the chain reports they were consumed.  Call repeatedly
-   * until `newOutputs` stabilises to 0.
+   * **Full paginated mode (default):** Pages through the live UTXO set (`GET /utxos`) ordered by
+   * commitment id. Each call reads at most `maxPages` pages and saves its cursor, so a large set
+   * is covered across several calls rather than in one unbounded loop; the cursor is cleared once
+   * the last page is reached, and the next call starts a fresh sweep.
    *
-   * **Full paginated mode** (`mode: "full"`): Pages through the entire live UTXO set ordered by
-   * commitment id.  Use when watermarks are lost or a complete re-scan is needed.  More expensive
-   * than incremental for large resources; for new ones the two modes are equivalent.
+   * **Incremental mode** (`mode: "delta"`): Uses `POST /utxos/stream` with saved shard watermarks.
+   * Not the default: against the Esmeralda indexer on 2026-10-27 it returned an empty body for an
+   * empty-watermark request (observed only; the endpoint's intended semantics are unverified).
+   * Spent updates from it are recorded as *inferred* spends, which a later sighting can undo.
    *
-   * In both modes the scan saves its checkpoint automatically and resumes from there on the next
-   * call, so a mid-scan crash loses at most one batch.
+   * Any owned output seen in the live set that a local record had marked spent only on an
+   * indexer's say-so is revived (see `reviveShieldedOutput`).
    *
-   * @param resourceAddress - The resource whose UTXOs to scan (hex, no "resource_" prefix needed).
-   * @param indexerBaseUrl  - The indexer's REST base URL (the same one passed to
-   *                          `IndexerProvider.connect({ url: ... })`).
-   * @param opts.mode       - `"delta"` (default) for incremental, `"full"` for a paginated sweep.
+   * @param resourceAddress - The resource whose UTXOs to scan.
+   * @param indexerBaseUrl  - The indexer's REST base URL.
+   * @param opts.mode       - `"full"` (default) or `"delta"`.
    * @param opts.perShardLimit - Max updates per shard per delta call (default 200).
    * @param opts.pageSize   - Page size for full-scan mode (default 100).
-   * @returns Number of newly found outputs and newly marked-spent outputs.
+   * @param opts.maxPages   - Pages (full) or rounds (delta) read per call (default 20).
+   * @returns Newly found, newly marked-spent, and revived output counts.
    */
   async scanForOwnedUtxos(
     resourceAddress: string,
     indexerBaseUrl: string,
-    opts: { mode?: "delta" | "full"; perShardLimit?: number; pageSize?: number } = {},
-  ): Promise<{ newOutputs: number; markedSpent: number }> {
-    // "full" uses GET /utxos (paginated snapshot) which works on current indexers.
-    // "delta" uses POST /utxos/stream (live-push NDJSON) which is a watch stream,
-    // not a catch-up replay -- it returns an empty body on first call and is not
-    // suitable for historical scanning until the indexer supports replay mode.
-    const { mode = "full", perShardLimit = 200, pageSize = 100 } = opts;
+    opts: { mode?: "delta" | "full"; perShardLimit?: number; pageSize?: number; maxPages?: number } = {},
+  ): Promise<{ newOutputs: number; markedSpent: number; revived: number }> {
+    const { mode = "full", perShardLimit = 200, pageSize = 100, maxPages = 20 } = opts;
     const accountId = localAccountId(this.index);
     const viewSecret = await this.signer.getViewSecret();
     const crypto = new WasmStealthCrypto(this.network);
+    const known = new Set((await listShieldedOutputs(accountId)).map((r) => r.commitment));
     let newOutputs = 0;
     let markedSpent = 0;
+    let revived = 0;
 
     const recordOutput = async (raw: { resourceAddress: string; commitment: string; amount: bigint; transactionId: string; memo?: string }): Promise<void> => {
+      if (known.has(raw.commitment)) {
+        if (await reviveShieldedOutput(accountId, raw.commitment)) revived++;
+        return;
+      }
       await addShieldedOutput({
         accountId,
         resourceAddress: raw.resourceAddress,
@@ -3849,40 +3890,44 @@ export class OotleAccount implements WalletAccountApi {
         createdAt: Date.now(),
         spent: false,
       });
+      known.add(raw.commitment);
       newOutputs++;
     };
 
     if (mode === "delta") {
       let watermarks: UtxoScanWatermark = await getUtxoScanWatermarks(accountId, resourceAddress);
-      let hasMore = true;
-      while (hasMore) {
+      for (let round = 0; round < maxPages; round++) {
         const result = await scanUtxosDelta(indexerBaseUrl, resourceAddress, crypto, viewSecret, watermarks, perShardLimit);
         for (const output of result.owned) await recordOutput(output);
         for (const commitment of result.spentCommitments) {
-          await markShieldedOutputSpent(accountId, commitment);
+          if (!known.has(commitment)) continue;
+          await markShieldedOutputSpent(accountId, commitment, "inferred");
           markedSpent++;
         }
+        const advanced = JSON.stringify(result.watermarks) !== JSON.stringify(watermarks);
         watermarks = result.watermarks;
         await setUtxoScanWatermarks(accountId, resourceAddress, watermarks);
-        hasMore = result.hasMore;
+        // A watermark that doesn't move would otherwise loop forever on an indexer that keeps
+        // reporting has_more.
+        if (!result.hasMore || !advanced) break;
       }
     } else {
       let cursor = await getUtxoScanPageCursor(accountId, resourceAddress);
-      let morePages = true;
-      while (morePages) {
+      for (let page = 0; page < maxPages; page++) {
         const result = await scanUtxosPage(indexerBaseUrl, resourceAddress, crypto, viewSecret, cursor, pageSize);
         for (const output of result.owned) await recordOutput(output);
-        if (result.nextCursor) {
-          cursor = result.nextCursor;
-          await setUtxoScanPageCursor(accountId, resourceAddress, cursor);
-        } else {
+        // No next page, or one that doesn't move past this page (an indexer ignoring `from_id`):
+        // end this sweep so the next call starts over instead of looping on the same page.
+        if (!result.nextCursor || result.nextCursor === cursor) {
           await clearUtxoScanPageCursor(accountId, resourceAddress);
-          morePages = false;
+          break;
         }
+        cursor = result.nextCursor;
+        await setUtxoScanPageCursor(accountId, resourceAddress, cursor);
       }
     }
 
-    return { newOutputs, markedSpent };
+    return { newOutputs, markedSpent, revived };
   }
 }
 
