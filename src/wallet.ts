@@ -18,7 +18,6 @@ import {
   createOutput,
   decryptOwnedUtxo as upstreamDecryptOwnedUtxo,
   decryptInputData as upstreamDecryptInputData,
-  defaultIndexerUrl,
   getVaultIdsForAccount,
   resolveMaxEpoch,
   resolveTransaction,
@@ -94,7 +93,7 @@ import {
   verifyHtlcTerms,
 } from "./htlcSafety.js";
 import { buildOwnershipProofMessage, buildWalletOwnershipMessage } from "./ownershipProof.js";
-import { type NetworkName, toOotleNetwork } from "./ootleNetwork.js";
+import { type NetworkName, indexerUrlFor, toOotleNetwork } from "./ootleNetwork.js";
 import {
   addPendingShield,
   addShieldedOutput,
@@ -435,7 +434,7 @@ export class OotleAccount implements WalletAccountApi {
       // problem (unlike execute()'s later errors, which are meaningful on-chain rejections this
       // class deliberately leaves unwrapped) — mirrors the same "unreachable" framing
       // DaemonAccount.connectClient() uses for the equivalent first-contact step.
-      const url = defaultIndexerUrl(this.network);
+      const url = indexerUrlFor(this.network);
       try {
         this.provider = await withTimeout(
           IndexerProvider.connect({ url, network: this.network }),
@@ -825,7 +824,7 @@ export class OotleAccount implements WalletAccountApi {
     resolved.inputs = dedupeInputs(resolved.inputs);
     const signed = await signTransaction([this.signer, ...extraSigners], resolved);
     const envelope = sealTransaction(signed);
-    const res = await fetch(`${defaultIndexerUrl(this.network)}/transactions/dry-run`, {
+    const res = await fetch(`${indexerUrlFor(this.network)}/transactions/dry-run`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       // `TransactionEnvelope` (ootle-ts-bindings) is just `string` — the request body is the
@@ -1081,6 +1080,7 @@ export class OotleAccount implements WalletAccountApi {
    * of burning the whole retry budget re-observing the same stale state.
    */
   async claimTestnetXtr(maxFee = 5000n, retries = 10, retryDelayMs = 300) {
+    if (this.network === Network.MainNet) throw new Error("There is no faucet on mainnet.");
     const provider = await this.getProvider();
     const publicKeyHex = bytesToHex(await this.getPublicKey());
     const account = await this.getComponentAddress();
@@ -2337,7 +2337,7 @@ export class OotleAccount implements WalletAccountApi {
    * submissions use — if it would be rejected. Nothing reaches consensus; nothing is spent.
    */
   private async dryRunEnvelope(envelope: string): Promise<ExecuteResult> {
-    const res = await fetch(`${defaultIndexerUrl(this.network)}/transactions/dry-run`, {
+    const res = await fetch(`${indexerUrlFor(this.network)}/transactions/dry-run`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ transaction: envelope }),
@@ -3645,7 +3645,7 @@ export class OotleAccount implements WalletAccountApi {
 
   /** Dry-runs a sealed claim and returns the fee it needs: what it was charged plus the allowance. */
   private async estimateClaimFee(dryRun: { envelope: string }, what = "claim"): Promise<bigint> {
-    const res = await fetch(`${defaultIndexerUrl(this.network)}/transactions/dry-run`, {
+    const res = await fetch(`${indexerUrlFor(this.network)}/transactions/dry-run`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ transaction: dryRun.envelope }),

@@ -62,6 +62,18 @@ See `src/wallet.ts`'s doc comments for the full `OotleAccount` surface — `send
 `shield`/`unshield`, `htlcFund`/`htlcClaim`/`htlcRefund`, `claimTestnetXtr`, `execute` (the general
 instruction-builder escape hatch, with automatic missing-input discovery and lock-contention retry).
 
+### Networks
+
+`NetworkName` is `"mainnet" | "esmeralda" | "igor"`. Mainnet holds real value; `isTestnet(name)`
+tells the two apart, and `claimTestnetXtr` refuses on mainnet. The same seed gives the same keys on
+every network; only the address prefix differs (`otl_1…` on mainnet, `otl_esm_1…` on Esmeralda), and
+every transaction carries its network byte, so one signed for a testnet can't be replayed on mainnet.
+
+Indexers come from the SDK's own table (`indexerUrlFor`): mainnet is
+`https://indexer-a.ootle.tari.com` (tari-ootle's default), Esmeralda keeps
+`https://ootle-indexer-a.tari.com`, and Igor has none. Point a network elsewhere with
+`setIndexerUrl(Network.MainNet, url)` before creating accounts.
+
 ### Claiming a Minotari (L1) burn
 
 A burn addressed to this account's public key (`getPublicKey()`) is claimed with `claimBurn`. Build

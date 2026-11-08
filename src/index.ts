@@ -39,7 +39,7 @@ export {
 } from "./htlcSafety.js";
 
 export type { NetworkName } from "./ootleNetwork.js";
-export { toOotleNetwork } from "./ootleNetwork.js";
+export { NETWORK_NAMES, indexerUrlFor, isNetworkName, isTestnet, networkNameFromByte, setIndexerUrl, toOotleNetwork } from "./ootleNetwork.js";
 
 export { OWNERSHIP_PROOF_CHALLENGE_MAX_LENGTH, buildOwnershipProofMessage, buildWalletOwnershipMessage } from "./ownershipProof.js";
 
