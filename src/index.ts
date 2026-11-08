@@ -43,6 +43,9 @@ export { toOotleNetwork } from "./ootleNetwork.js";
 
 export { OWNERSHIP_PROOF_CHALLENGE_MAX_LENGTH, buildOwnershipProofMessage, buildWalletOwnershipMessage } from "./ownershipProof.js";
 
+export type { OutputOwnershipProof, ProofNetwork, ProofVerdict, WalletOwnershipProof } from "./verifyOwnershipProof.js";
+export { verifyOwnershipProof, verifySchnorrSignature, verifyWalletOwnershipProof } from "./verifyOwnershipProof.js";
+
 export type { EncryptedVault } from "./vault.js";
 export { decryptVault, encryptVault, fromHex, toHex } from "./vault.js";
 
