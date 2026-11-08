@@ -66,6 +66,19 @@ describe("mainnet accounts", () => {
     expect(Array.from(parsedMain.owner_key)).toEqual(Array.from(parsedEsme.owner_key));
   });
 
+  it("refuses to pay an address for another network, before touching the indexer", async () => {
+    const main = OotleAccount.fromSeed(new Uint8Array(16).fill(7), 0, "mainnet");
+    const esme = OotleAccount.fromSeed(new Uint8Array(16).fill(8), 0, "esmeralda");
+    const esmeAddress = await esme.getWalletAddress();
+    const mainAddress = await main.getWalletAddress();
+    const R = "resource_0101010101010101010101010101010101010101010101010101010101010101";
+    await expect(main.send(esmeAddress, R, 1n)).rejects.toThrow(/for esmeralda, but this account is on mainnet/);
+    await expect(main.sendPrivately(R, esmeAddress, 1n)).rejects.toThrow(/for esmeralda, but this account is on mainnet/);
+    await expect(main.htlcFund(R, 1n, esmeAddress, "00".repeat(32), 10n)).rejects.toThrow(/for esmeralda, but this account is on mainnet/);
+    await expect(esme.send(mainAddress, R, 1n)).rejects.toThrow(/for mainnet, but this account is on esmeralda/);
+    await expect(main.send("otl_not_an_address", R, 1n)).rejects.toThrow(/not a valid otl_ address/);
+  });
+
   it("refuses the faucet", async () => {
     const main = OotleAccount.fromSeed(new Uint8Array(16).fill(7), 0, "mainnet");
     await expect(main.claimTestnetXtr()).rejects.toThrow(/no faucet on mainnet/);

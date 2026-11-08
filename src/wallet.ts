@@ -93,7 +93,7 @@ import {
   verifyHtlcTerms,
 } from "./htlcSafety.js";
 import { buildOwnershipProofMessage, buildWalletOwnershipMessage } from "./ownershipProof.js";
-import { type NetworkName, indexerUrlFor, toOotleNetwork } from "./ootleNetwork.js";
+import { type NetworkName, indexerUrlFor, networkNameFromByte, toOotleNetwork } from "./ootleNetwork.js";
 import {
   addPendingShield,
   addShieldedOutput,
@@ -457,6 +457,27 @@ export class OotleAccount implements WalletAccountApi {
    */
   async getWalletAddress(): Promise<string> {
     return this.signer.getAddress();
+  }
+
+  /**
+   * Refuses an `otl_` address that names a different network from this account's. The component
+   * address is derived from the key alone, so a testnet address used on mainnet would still pay its
+   * owner's mainnet account -- but a mismatch nearly always means the sender has the wrong network
+   * or the wrong address in hand, and on mainnet that costs real money. Throws on an address that
+   * doesn't parse, too.
+   */
+  private assertSameNetwork(address: string, role: string): void {
+    let byte: number;
+    try {
+      byte = parseOotleAddress(address.trim()).network;
+    } catch {
+      throw new Error(`${role} address is not a valid otl_ address.`);
+    }
+    if (byte !== this.network) {
+      const theirs = networkNameFromByte(byte) ?? `network ${byte}`;
+      const ours = networkNameFromByte(this.network) ?? `network ${this.network}`;
+      throw new Error(`${role} address is for ${theirs}, but this account is on ${ours}. Check you have the right address and network.`);
+    }
   }
 
   /**
@@ -943,6 +964,7 @@ export class OotleAccount implements WalletAccountApi {
     if (amount <= 0n) throw new Error(`send: amount must be greater than zero, got ${amount}`);
     const account = await this.getComponentAddress();
     const isWalletAddress = recipientAddress.startsWith("otl");
+    if (isWalletAddress) this.assertSameNetwork(recipientAddress, "The recipient");
     const recipient = isWalletAddress ? componentAddressFromWalletAddress(recipientAddress) : recipientAddress;
 
     const instructions: Instruction[] = [];
@@ -2514,6 +2536,7 @@ export class OotleAccount implements WalletAccountApi {
     options: HtlcFundOptions = {}
   ): Promise<HtlcFundResult> {
     if (amount <= 0n) throw new Error("htlcFund: amount must be greater than zero.");
+    this.assertSameNetwork(claimantWalletAddress, "The claimant");
     const opId = newOperationId("htlc-fund");
     const accountId = localAccountId(this.index);
     const provider = await this.getProvider();
@@ -3081,6 +3104,7 @@ export class OotleAccount implements WalletAccountApi {
     feeType: FeeType = { kind: "transparent" },
   ): Promise<{ transactionId: string; recipientCommitment: string; recipientSubstateId: string; minimumValuePromise: string }> {
     assertValidMinimumValuePromise(minimumValuePromise, amount);
+    this.assertSameNetwork(recipientWalletAddress, "The recipient");
     const accountId = localAccountId(this.index);
     const opId = newOperationId("send-private");
     const unavailable = await this.unavailableCommitments(accountId, opId);
