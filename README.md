@@ -124,12 +124,21 @@ await account.refundFromJournal(fund.journalId);
   `isHtlcClaimableByEpoch`.
 - Claimed and refunded outputs are recorded in the shielded ledger, so they're spendable at once.
 
+## Verifying ownership proofs
+
+A site that receives `{ walletAddress, publicNonce, signature }` from
+`tari_signWalletOwnershipChallenge` checks it with `verifyWalletOwnershipProof` (and a per-output
+proof with `verifyOwnershipProof`), taking the key from the address it already had in mind. The
+byte spec is in [docs/ownership-proof.md](docs/ownership-proof.md);
+`src/fixtures/ownershipProof.vectors.json` holds fixed vectors produced with Tari's real signer
+(test-only keys).
+
 ## What's in here, and what isn't
 
 - **Account core** (`wallet.ts`): `OotleAccount`, balance/plan-resolution helpers, the transaction
   auto-resolve retry loop.
 - **Crypto/derivation**: `derivation.ts`, `domainHash.ts`, `componentAddress.ts`, `vault.ts`,
-  `ownershipProof.ts`, `confidential.ts`.
+  `ownershipProof.ts`, `verifyOwnershipProof.ts`, `confidential.ts`.
 - **HTLC**: `htlc.ts` (condition trees), `htlcSafety.ts` (epoch rules, pre-claim verification,
   per-output masks, outcome classification) + the journaled `OotleAccount` HTLC methods.
 - **L1 burn claims**: `burnClaim.ts` (proof assembly) + `OotleAccount.claimBurn`.
@@ -152,10 +161,3 @@ npm run build
 MIT — see [LICENSE](LICENSE). (The two wallets this was extracted from are licensed separately,
 under PolyForm Noncommercial; this SDK is deliberately more permissive so other Ootle projects can
 build on it without that restriction.)
-
-## Verifying ownership proofs
-
-A site that receives `{ walletAddress, publicNonce, signature }` from `tari_signWalletOwnershipChallenge` checks it with
-`verifyWalletOwnershipProof` (and a per-output proof with `verifyOwnershipProof`), taking the key from the address it already
-had in mind. The byte spec is in [docs/ownership-proof.md](docs/ownership-proof.md); `src/fixtures/ownershipProof.vectors.json`
-holds fixed vectors produced with Tari's real signer (test-only keys).

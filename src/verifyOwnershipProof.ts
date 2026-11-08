@@ -16,9 +16,9 @@
 // group order. `s` must be canonical (0 < s < l): a non-canonical scalar is a malleable signature,
 // which tari-crypto also refuses.
 import { ristretto255 } from "@noble/curves/ed25519.js";
+import { Network } from "@tari-project/ootle";
 import { parseOotleAddress } from "@tari-project/ootle-wasm";
 import { DomainSeparatedHasher } from "./domainHash.js";
-import { Network } from "@tari-project/ootle";
 import { OWNERSHIP_PROOF_CHALLENGE_MAX_LENGTH, buildOwnershipProofMessage, buildWalletOwnershipMessage } from "./ownershipProof.js";
 
 const { Point } = ristretto255;
@@ -40,6 +40,7 @@ function proofNetworkFromByte(byte: number): ProofNetwork | undefined {
       return undefined;
   }
 }
+
 const GROUP_ORDER = (1n << 252n) + 27742317777372353535851937790883648493n;
 
 function scalarFromBytesLE(bytes: Uint8Array): bigint {
@@ -74,7 +75,10 @@ export function verifySchnorrSignature(publicKey: Uint8Array, message: Uint8Arra
       .chain(message)
       .finalize();
     const e = scalarFromBytesLE(challenge) % GROUP_ORDER;
-    return Point.BASE.multiply(s).equals(R.add(P.multiply(e)));
+    // noble's multiply() throws on a zero scalar. e = 0 is a 2^-252 event, but the right answer
+    // there is s·G == R, not the catch-all false below.
+    const eP = e === 0n ? Point.ZERO : P.multiply(e);
+    return Point.BASE.multiply(s).equals(R.add(eP));
   } catch {
     return false;
   }
@@ -105,9 +109,10 @@ export function verifyWalletOwnershipProof({ walletAddress, challenge, publicNon
   if (challenge.length > OWNERSHIP_PROOF_CHALLENGE_MAX_LENGTH) {
     return { valid: false, reason: `challenge is longer than ${OWNERSHIP_PROOF_CHALLENGE_MAX_LENGTH} characters, which the wallet refuses to sign.` };
   }
+  const address = walletAddress.trim();
   let parsed;
   try {
-    parsed = parseOotleAddress(walletAddress.trim());
+    parsed = parseOotleAddress(address);
   } catch {
     return { valid: false, reason: "walletAddress is not a valid otl_ address." };
   }
@@ -116,7 +121,7 @@ export function verifyWalletOwnershipProof({ walletAddress, challenge, publicNon
   const R = bytesOf(publicNonce);
   const s = bytesOf(signature);
   if (!R || !s) return { valid: false, reason: "publicNonce and signature must be 32-byte hex strings or byte arrays." };
-  const message = buildWalletOwnershipMessage(parsed.network, walletAddress.trim(), challenge);
+  const message = buildWalletOwnershipMessage(parsed.network, address, challenge);
   return verifySchnorrSignature(parsed.owner_key, message, R, s)
     ? { valid: true, network }
     : { valid: false, reason: "The signature does not match this wallet address and challenge." };
