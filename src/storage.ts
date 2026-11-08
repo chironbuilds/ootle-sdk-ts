@@ -187,6 +187,25 @@ export function localAccountId(index: number): string {
   return `local:${index}`;
 }
 
+const MAINNET_LEDGER_PREFIX = "mainnet:";
+
+/**
+ * The id an account's records are kept under in this store: its shielded outputs, scan cursors and
+ * watermarks, pending shields, reservations and HTLC journal. One seed gives the same keys and the
+ * same `local:N` on every network, so without the network in the id a mainnet account would read
+ * and spend its testnet twin's records. Mainnet ids are prefixed; testnet ids stay `local:N`, as
+ * every earlier build wrote them, so existing testnet data needs no migration.
+ */
+export function ledgerAccountId(index: number, mainnet: boolean): string {
+  const id = localAccountId(index);
+  return mainnet ? `${MAINNET_LEDGER_PREFIX}${id}` : id;
+}
+
+/** Whether a ledger id (see `ledgerAccountId`) belongs to a mainnet account. */
+export function isMainnetLedgerId(accountId: string): boolean {
+  return accountId.startsWith(MAINNET_LEDGER_PREFIX);
+}
+
 async function read(): Promise<OotleState> {
   const raw = await store().get<Partial<OotleState>>(STORAGE_KEY);
   return { ...DEFAULTS, ...raw };

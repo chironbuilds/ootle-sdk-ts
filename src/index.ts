@@ -64,6 +64,8 @@ export {
   getUtxoScanWatermarks,
   listPendingShields,
   listShieldedOutputs,
+  isMainnetLedgerId,
+  ledgerAccountId,
   localAccountId,
   markShieldedOutputSpent,
   reviveShieldedOutput,

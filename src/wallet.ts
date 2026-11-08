@@ -108,7 +108,8 @@ import {
   listPendingShields,
   listReservedCommitments,
   listShieldedOutputs,
-  localAccountId,
+  isMainnetLedgerId,
+  ledgerAccountId,
   markShieldedOutputSpent,
   reviveShieldedOutput,
   putHtlcJournalEntry,
@@ -420,6 +421,17 @@ export class OotleAccount implements WalletAccountApi {
     this.ownerSecret = ownerSecret;
   }
 
+  /**
+   * The id this account's records live under in the SDK store (see `ledgerAccountId`): `local:N`
+   * on a testnet, `mainnet:local:N` on mainnet, so the same seed's accounts never share shielded
+   * outputs, scan state or journals across networks. Read at call time, so a host that re-points
+   * `index` at its own ledger slot (an imported seed) is honoured. Use this, not `localAccountId`,
+   * whenever reading this account's records directly.
+   */
+  get ledgerId(): string {
+    return ledgerAccountId(this.index, this.network === Network.MainNet);
+  }
+
   /** `entropy` is the 16-byte CipherSeed entropy (see cipherSeed.ts), not a raw 32-byte seed. */
   static fromSeed(entropy: Uint8Array, index: number, networkName: NetworkName): OotleAccount {
     const network = toOotleNetwork(networkName);
@@ -553,7 +565,7 @@ export class OotleAccount implements WalletAccountApi {
     // live, the next balance read counts it again. The vault lookup above already proved the
     // indexer is reachable in this same call, which is what makes a per-id failure here meaningful
     // rather than just noise.
-    const unspentRecords = (await listShieldedOutputs(localAccountId(this.index))).filter((r) => !r.spent);
+    const unspentRecords = (await listShieldedOutputs(this.ledgerId)).filter((r) => !r.spent);
     const liveness = await Promise.all(
       unspentRecords.map(async (record) => {
         try {
@@ -707,12 +719,12 @@ export class OotleAccount implements WalletAccountApi {
     // tokens) — hit exactly this exhausting 20 on a real 2-hop swap.
     const maxRetries = opts.maxRetries ?? 30;
     const seenAddresses = new Set<string>();
-    let inputs = await applyKnownVersions(opts.inputs ? [...opts.inputs] : []);
+    let inputs = await applyKnownVersions(opts.inputs ? [...opts.inputs] : [], this.network);
 
     // Built once, outside the retry loop, like `maxEpoch` above: the fee stealth proof doesn't
     // depend on which main-instruction substates a given attempt discovers, so redoing the
     // indexer round trip + proof generation on every retry would buy nothing.
-    const accountId = localAccountId(this.index);
+    const accountId = this.ledgerId;
     const privateFee = await this.resolvePrivateFee(feeType, maxFee);
 
     for (let attempt = 0; ; attempt++) {
@@ -730,7 +742,7 @@ export class OotleAccount implements WalletAccountApi {
         const extraSigners = privateFee ? [privateFee.feeSigner] : [];
         if (opts.dryRun) return await withTimeout(this.submitDryRun(provider, unsignedTx, extraSigners), 30_000, "submitting the transaction");
         const result = await withTimeout(this.submitReal(provider, unsignedTx, extraSigners), 60_000, "submitting the transaction");
-        await recordKnownVersions(result);
+        await recordKnownVersions(result, this.network);
         if (privateFee && feeType.kind === "private") {
           await this.recordPrivateFeeSpend(accountId, feeType.feeResourceAddress, privateFee, String(result.transaction_id));
         }
@@ -771,7 +783,7 @@ export class OotleAccount implements WalletAccountApi {
             // `forgetKnownVersions`'s doc comment) -- the local N+1 computed below is correct for
             // *this* attempt, but leaving the stale entry in place would win out again on some
             // later, unrelated transaction that resolves this same substate from scratch.
-            await forgetKnownVersions([staleVersion.substateId]);
+            await forgetKnownVersions([staleVersion.substateId], this.network);
             inputs = inputs.map((input) =>
               input.substate_id === staleVersion.substateId ? { ...input, version: staleVersion.version + 1 } : input
             );
@@ -786,7 +798,7 @@ export class OotleAccount implements WalletAccountApi {
           // overwrites the freshly resolved (correct) version with the stale one and the next
           // attempt fails identically. Persisted, so one bad write wedges every later transaction
           // across reloads. Forget those entries and trust the chain.
-          await forgetKnownVersions(inputs.map((i) => i.substate_id));
+          await forgetKnownVersions(inputs.map((i) => i.substate_id), this.network);
           inputs = resolved;
           continue;
         }
@@ -813,7 +825,7 @@ export class OotleAccount implements WalletAccountApi {
               `funded once. (${resolveError instanceof Error ? resolveError.message.slice(0, 120) : String(resolveError)})`,
           );
         }
-        inputs = await applyKnownVersions([...inputs, resolved]);
+        inputs = await applyKnownVersions([...inputs, resolved], this.network);
       }
     }
   }
@@ -1136,7 +1148,7 @@ export class OotleAccount implements WalletAccountApi {
         // This is typically the first transaction for a brand-new account — recording its
         // resulting versions (the newly-created fee vault included) closes the exact gap that
         // otherwise bites the *next* transaction (see `applyKnownVersions`'s doc comment).
-        await recordKnownVersions(result);
+        await recordKnownVersions(result, this.network);
         return result;
       } catch (e) {
         // "Failed to decode transaction: unexpected type null at position N: expected u64" is a
@@ -1208,7 +1220,7 @@ export class OotleAccount implements WalletAccountApi {
     feeType: FeeType = { kind: "transparent" },
   ): Promise<{ transactionId: string; commitment: string; substateId: string; minimumValuePromise: string }> {
     assertValidMinimumValuePromise(minimumValuePromise, amount);
-    const accountId = localAccountId(this.index);
+    const accountId = this.ledgerId;
     const provider = await this.getProvider();
     const account = await this.getComponentAddress();
     // Output.destination decodes as a bech32m wallet address (owner_key + view_key), NOT the
@@ -1243,7 +1255,7 @@ export class OotleAccount implements WalletAccountApi {
       const response = await this.pollRecordingFee(accountId, feeType, privateFee, transactionId, () =>
         withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the shield transaction"),
       );
-      await recordKnownVersions(response);
+      await recordKnownVersions(response, this.network);
       await recordKnownShieldedOutput(accountId, resourceAddress, ownCommitment, amount, transactionId, memo);
       if (privateFee && feeType.kind === "private") {
         await this.recordPrivateFeeSpend(accountId, feeType.feeResourceAddress, privateFee, transactionId);
@@ -1368,7 +1380,7 @@ export class OotleAccount implements WalletAccountApi {
     memo?: string,
     feeType: FeeType = { kind: "transparent" },
   ): Promise<{ transactionId: string }> {
-    const accountId = localAccountId(this.index);
+    const accountId = this.ledgerId;
     const opId = newOperationId("unshield");
     const unavailable = await this.unavailableCommitments(accountId, opId);
     const records = await this.filterReadableShieldedOutputs(
@@ -1445,7 +1457,7 @@ export class OotleAccount implements WalletAccountApi {
         const response = await this.pollRecordingFee(accountId, feeType, privateFee, transactionId, () =>
           withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the unshield transaction"),
         );
-        await recordKnownVersions(response);
+        await recordKnownVersions(response, this.network);
         await recordKnownShieldedOutput(accountId, resourceAddress, ownCommitment, remainder, transactionId, memo);
         for (const commitment of commitments) {
           await markShieldedOutputSpent(accountId, commitment);
@@ -1506,12 +1518,12 @@ export class OotleAccount implements WalletAccountApi {
     const builder = await this.buildWithdrawStealthAndExecute(provider, account, resourceAddress, amount, workspaceVarName, followUpInstructions, relatedComponents);
     const viewSecret = await this.signer.getViewSecret();
     const { transactionId, privateFee } = await this.prepareSignSubmit(builder as unknown as StealthTransfer, provider, account, maxFee, feeType, { viewSecret });
-    const response = await this.pollRecordingFee(localAccountId(this.index), feeType, privateFee, transactionId, () =>
+    const response = await this.pollRecordingFee(this.ledgerId, feeType, privateFee, transactionId, () =>
       withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the transaction"),
     );
-    await recordKnownVersions(response);
+    await recordKnownVersions(response, this.network);
     if (privateFee && feeType.kind === "private") {
-      await this.recordPrivateFeeSpend(localAccountId(this.index), feeType.feeResourceAddress, privateFee, transactionId);
+      await this.recordPrivateFeeSpend(this.ledgerId, feeType.feeResourceAddress, privateFee, transactionId);
     }
     return { transactionId };
   }
@@ -1709,12 +1721,12 @@ export class OotleAccount implements WalletAccountApi {
     );
     const envelope = privateFee ? await this.sealWithPrivateFee(authorized, privateFee.feeSigner) : await authorized.seal();
     const transactionId = await submitTransaction(provider, envelope);
-    const response = await this.pollRecordingFee(localAccountId(this.index), feeType, privateFee, transactionId, () =>
+    const response = await this.pollRecordingFee(this.ledgerId, feeType, privateFee, transactionId, () =>
       withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the redemption transaction"),
     );
-    await recordKnownVersions(response);
+    await recordKnownVersions(response, this.network);
     if (privateFee && feeType.kind === "private") {
-      await this.recordPrivateFeeSpend(localAccountId(this.index), feeType.feeResourceAddress, privateFee, transactionId);
+      await this.recordPrivateFeeSpend(this.ledgerId, feeType.feeResourceAddress, privateFee, transactionId);
     }
     return { transactionId };
   }
@@ -1951,7 +1963,7 @@ export class OotleAccount implements WalletAccountApi {
     reservationHolder?: string
   ): Promise<PrivateFeeMaterial | null> {
     if (feeType.kind !== "private") return null;
-    const accountId = localAccountId(this.index);
+    const accountId = this.ledgerId;
     const records = await listShieldedOutputs(accountId);
     for (const unavailable of await this.unavailableCommitments(accountId, reservationHolder)) exclude = [...exclude, unavailable];
     // Retries with the next-smallest qualifying UTXO if one fails to read -- confirmed live that a
@@ -2056,7 +2068,7 @@ export class OotleAccount implements WalletAccountApi {
     minimumValuePromise: bigint,
     opId: string
   ): Promise<{ transactionId: string; recipientCommitment: string; recipientSubstateId: string; minimumValuePromise: string }> {
-    const accountId = localAccountId(this.index);
+    const accountId = this.ledgerId;
     records = await this.filterReadableShieldedOutputs(records, resourceAddress, amount + maxFee);
     // Enough inputs for the amount plus the fee limit when the balance allows; otherwise all of
     // them -- the measured fee is usually far below the limit, and `build` checks the real one.
@@ -2168,7 +2180,7 @@ export class OotleAccount implements WalletAccountApi {
       });
       try {
         const response = await withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the private send");
-        await recordKnownVersions(response);
+        await recordKnownVersions(response, this.network);
         if (attempt.changeCommitment) {
           await recordKnownShieldedOutput(accountId, resourceAddress, attempt.changeCommitment, attempt.change, transactionId);
         }
@@ -2212,7 +2224,7 @@ export class OotleAccount implements WalletAccountApi {
    * record the indexer can't answer for right now is left as it is.
    */
   async pruneSpentShieldedOutputs(): Promise<number> {
-    const accountId = localAccountId(this.index);
+    const accountId = this.ledgerId;
     const before = (await listShieldedOutputs(accountId)).filter((r) => !r.spent).length;
     await this.checkShieldedOutputs(await listShieldedOutputs(accountId));
     const after = (await listShieldedOutputs(accountId)).filter((r) => !r.spent).length;
@@ -2221,7 +2233,7 @@ export class OotleAccount implements WalletAccountApi {
 
   /** Reads each unspent record's UTXO; returns the unusable commitments, marking the definitively spent ones. */
   private async checkShieldedOutputs(records: ShieldedOutputRecord[]): Promise<Set<string>> {
-    const accountId = localAccountId(this.index);
+    const accountId = this.ledgerId;
     const provider = await this.getProvider();
     const crypto = new WasmStealthCrypto(this.network);
     const viewSecret = await this.signer.getViewSecret();
@@ -2485,7 +2497,7 @@ export class OotleAccount implements WalletAccountApi {
     const envelope = sealTransaction(signed);
     const transactionId = await submitTransaction(provider, envelope);
     const response = await withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the private-fee redemption transaction");
-    await recordKnownVersions(response);
+    await recordKnownVersions(response, this.network);
     return { transactionId, feeChangeCommitment };
   }
 
@@ -2538,7 +2550,7 @@ export class OotleAccount implements WalletAccountApi {
     if (amount <= 0n) throw new Error("htlcFund: amount must be greater than zero.");
     this.assertSameNetwork(claimantWalletAddress, "The claimant");
     const opId = newOperationId("htlc-fund");
-    const accountId = localAccountId(this.index);
+    const accountId = this.ledgerId;
     const provider = await this.getProvider();
     const account = await this.getComponentAddress();
     const walletAddress = await this.getWalletAddress();
@@ -2864,7 +2876,7 @@ export class OotleAccount implements WalletAccountApi {
   /** Refunds an HTLC this account funded, using the conditions/mask/amount `htlcFund` journaled. */
   async refundFromJournal(journalId: string, maxFee = 50000n, feeType: FeeType = { kind: "transparent" }): Promise<HtlcSpendResult> {
     const entry = await getHtlcJournalEntry(journalId);
-    if (!entry || entry.kind !== "fund" || entry.accountId !== localAccountId(this.index)) {
+    if (!entry || entry.kind !== "fund" || entry.accountId !== this.ledgerId) {
       throw new Error(`refundFromJournal: ${journalId} is not an HTLC this account funded.`);
     }
     if (!entry.htlcCommitment || !entry.outputMask) throw new Error(`refundFromJournal: ${journalId} has no HTLC commitment/mask recorded.`);
@@ -2888,7 +2900,7 @@ export class OotleAccount implements WalletAccountApi {
     label: string;
   }): Promise<HtlcSpendResult> {
     const opId = newOperationId(`htlc-${p.kind}`);
-    const accountId = localAccountId(this.index);
+    const accountId = this.ledgerId;
     const provider = await this.getProvider();
     const account = await this.getComponentAddress();
     const substateId = stealthUtxoSubstateId(p.resourceAddress, fromHex(p.commitmentHex));
@@ -2970,7 +2982,7 @@ export class OotleAccount implements WalletAccountApi {
   /** Applies a confirmed HTLC operation's local bookkeeping. Idempotent (see `addShieldedOutput`). */
   private async finalizeHtlcEntry(entry: HtlcJournalEntry, response: IndexerGetTransactionResultResponse): Promise<void> {
     const txId = entry.transactionId!;
-    await recordKnownVersions(response);
+    await recordKnownVersions(response, this.network);
     if (entry.ownCommitment && entry.ownAmount) {
       await recordKnownShieldedOutput(entry.accountId, entry.resourceAddress, entry.ownCommitment, BigInt(entry.ownAmount), txId);
     }
@@ -2986,7 +2998,7 @@ export class OotleAccount implements WalletAccountApi {
   /** This account's HTLC journal (every fund/claim/refund and its state), newest first. The
    * entries' `envelope` of a claim contains the preimage — don't display or export it. */
   async listHtlcs(): Promise<HtlcJournalEntry[]> {
-    return (await listHtlcJournal(localAccountId(this.index))).sort((a, b) => b.createdAt - a.createdAt);
+    return (await listHtlcJournal(this.ledgerId)).sort((a, b) => b.createdAt - a.createdAt);
   }
 
   /**
@@ -2999,7 +3011,7 @@ export class OotleAccount implements WalletAccountApi {
    */
   async reconcileHtlcs(): Promise<HtlcJournalEntry[]> {
     const provider = await this.getProvider();
-    const open = (await listHtlcJournal(localAccountId(this.index))).filter((e) =>
+    const open = (await listHtlcJournal(this.ledgerId)).filter((e) =>
       ["prepared", "claim_armed", "submitted", "unknown"].includes(e.status)
     );
     const out: HtlcJournalEntry[] = [];
@@ -3105,7 +3117,7 @@ export class OotleAccount implements WalletAccountApi {
   ): Promise<{ transactionId: string; recipientCommitment: string; recipientSubstateId: string; minimumValuePromise: string }> {
     assertValidMinimumValuePromise(minimumValuePromise, amount);
     this.assertSameNetwork(recipientWalletAddress, "The recipient");
-    const accountId = localAccountId(this.index);
+    const accountId = this.ledgerId;
     const opId = newOperationId("send-private");
     const unavailable = await this.unavailableCommitments(accountId, opId);
     const records = await this.filterReadableShieldedOutputs(
@@ -3201,7 +3213,7 @@ export class OotleAccount implements WalletAccountApi {
         const response = await this.pollRecordingFee(accountId, feeType, privateFee, transactionId, () =>
           withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the private send"),
         );
-        await recordKnownVersions(response);
+        await recordKnownVersions(response, this.network);
         if (ownCommitment) await recordKnownShieldedOutput(accountId, resourceAddress, ownCommitment, changeAmount, transactionId);
         for (const commitment of commitments) {
           await markShieldedOutputSpent(accountId, commitment);
@@ -3237,7 +3249,7 @@ export class OotleAccount implements WalletAccountApi {
    * shielded-outputs picker.
    */
   async claimPrivatePayment(resourceAddress: string, commitmentHex: string): Promise<{ amount: bigint; memo?: string }> {
-    const accountId = localAccountId(this.index);
+    const accountId = this.ledgerId;
     const existing = await listShieldedOutputs(accountId);
     if (existing.some((r) => r.resourceAddress === resourceAddress && r.commitment === commitmentHex)) {
       throw new Error("You've already claimed this payment.");
@@ -3298,8 +3310,8 @@ export class OotleAccount implements WalletAccountApi {
       transactionId = await submitTransaction(provider, attempt.envelope);
       response = await withTimeout(pollTransactionResult(provider, transactionId), 90_000, "claiming the burn");
     }
-    await recordKnownVersions(response);
-    await recordKnownShieldedOutput(localAccountId(this.index), TARI_RESOURCE_ADDRESS, attempt.ownCommitment, attempt.claimedAmount, transactionId, memo);
+    await recordKnownVersions(response, this.network);
+    await recordKnownShieldedOutput(this.ledgerId, TARI_RESOURCE_ADDRESS, attempt.ownCommitment, attempt.claimedAmount, transactionId, memo);
     return { transactionId, claimedAmount: attempt.claimedAmount, commitment: attempt.ownCommitment, fee };
   }
 
@@ -3429,7 +3441,7 @@ export class OotleAccount implements WalletAccountApi {
     });
     try {
       const response = await withTimeout(pollTransactionResult(provider, transactionId), 60_000, "submitting the unshield transaction");
-      await recordKnownVersions(response);
+      await recordKnownVersions(response, this.network);
       await recordKnownShieldedOutput(accountId, resourceAddress, changeCommitment, remainder, transactionId, memo);
       for (const commitment of commitments) await markShieldedOutputSpent(accountId, commitment);
     } finally {
@@ -3462,7 +3474,7 @@ export class OotleAccount implements WalletAccountApi {
     if (resourceAddress !== TARI_RESOURCE_ADDRESS) {
       throw new Error("This account doesn't exist on-chain yet. Unshield some TARI first to create it, then unshield other resources.");
     }
-    const accountId = localAccountId(this.index);
+    const accountId = this.ledgerId;
     const crypto = new WasmStealthCrypto(this.network);
     const viewSecret = await this.signer.getViewSecret();
     const walletAddress = await this.getWalletAddress();
@@ -3577,7 +3589,7 @@ export class OotleAccount implements WalletAccountApi {
       transactionId = await submitTransaction(provider, attempt.envelope);
       response = await withTimeout(pollTransactionResult(provider, transactionId), 90_000, "unshielding into a new account");
     }
-    await recordKnownVersions(response);
+    await recordKnownVersions(response, this.network);
     for (const input of inputs) await markShieldedOutputSpent(accountId, input.commitmentHex);
     if (attempt.changeCommitment) {
       await recordKnownShieldedOutput(accountId, resourceAddress, attempt.changeCommitment, attempt.change, transactionId, memo);
@@ -3711,7 +3723,7 @@ export class OotleAccount implements WalletAccountApi {
    * Anything not in here is, as far as this wallet is concerned, not spendable.
    */
   async listUnspentShieldedOutputs(resourceAddress?: string): Promise<ShieldedOutputRecord[]> {
-    return selectUnspentShieldedOutputs(await listShieldedOutputs(localAccountId(this.index)), resourceAddress);
+    return selectUnspentShieldedOutputs(await listShieldedOutputs(this.ledgerId), resourceAddress);
   }
 
   /**
@@ -3771,7 +3783,7 @@ export class OotleAccount implements WalletAccountApi {
    * that is gone from the listing and cannot be recovered by this scan.
    */
   async scanForPrivatePayments(maxPages?: number, pageSize = 50): Promise<{ claimed: number; found: ScannedStealthOutput[] }> {
-    const accountId = localAccountId(this.index);
+    const accountId = this.ledgerId;
     const provider = await this.getProvider();
     const viewSecret = await this.signer.getViewSecret();
     const crypto = new WasmStealthCrypto(this.network);
@@ -3889,7 +3901,7 @@ export class OotleAccount implements WalletAccountApi {
     resourceAddress: string,
     opts: { maxPages?: number; pageSize?: number; limit?: number; transactionIds?: string[] } = {}
   ): Promise<ScannedStealthOutput[]> {
-    const accountId = localAccountId(this.index);
+    const accountId = this.ledgerId;
     const provider = await this.getProvider();
     const viewSecret = await this.signer.getViewSecret();
     const crypto = new WasmStealthCrypto(this.network);
@@ -4006,7 +4018,7 @@ export class OotleAccount implements WalletAccountApi {
     opts: { mode?: "delta" | "full"; perShardLimit?: number; pageSize?: number; maxPages?: number } = {},
   ): Promise<{ newOutputs: number; markedSpent: number; revived: number }> {
     const { mode = "full", perShardLimit = 200, pageSize = 100, maxPages = 20 } = opts;
-    const accountId = localAccountId(this.index);
+    const accountId = this.ledgerId;
     const viewSecret = await this.signer.getViewSecret();
     const crypto = new WasmStealthCrypto(this.network);
     const known = new Set((await listShieldedOutputs(accountId)).map((r) => r.commitment));
@@ -4459,9 +4471,15 @@ export function resolveSendPrivatelyPlan(
  * every pending shield, whichever local account they belong to — this is a read-only connection,
  * not account/signing-specific.
  */
-export async function recoverPendingShields(provider: IndexerProvider): Promise<void> {
+export async function recoverPendingShields(provider: IndexerProvider, network?: Network): Promise<void> {
   const pending = await listPendingShields();
   for (const p of pending) {
+    // A pending shield belongs to the network its ledger id names (see `ledgerAccountId`). Only
+    // that network's indexer can answer for it; asking another one just fails every time. With
+    // no `network` given, every entry is tried, as before.
+    const mainnetEntry = isMainnetLedgerId(p.accountId);
+    if (network !== undefined && mainnetEntry !== (network === Network.MainNet)) continue;
+    const entryNetwork = mainnetEntry ? Network.MainNet : Network.Esmeralda;
     try {
       const response = await getTransactionResultDecoded(provider, p.transactionId);
       const result = response.result;
@@ -4487,7 +4505,7 @@ export async function recoverPendingShields(provider: IndexerProvider): Promise<
         await markShieldedOutputSpent(p.accountId, p.privateFee.spentCommitment);
       }
       if (succeeded) {
-        await recordKnownVersions(response);
+        await recordKnownVersions(response, entryNetwork);
         if (p.ownCommitment) {
           await recordKnownShieldedOutput(p.accountId, p.resourceAddress, p.ownCommitment, BigInt(p.amount), p.transactionId, p.memo);
         }
@@ -4594,12 +4612,22 @@ async function loadKnownVersions(): Promise<Map<string, number>> {
   return knownVersionsPromise;
 }
 
+/**
+ * The cache key for a substate on `network`. A component address is derived from the key alone, so
+ * the same address exists on every network with unrelated versions; mainnet entries are prefixed
+ * so they never meet testnet ones. Testnet keys stay bare, exactly as every earlier build wrote
+ * them, so existing caches keep working.
+ */
+function versionKey(substateId: string, network: Network | undefined): string {
+  return network === Network.MainNet ? `mainnet:${substateId}` : substateId;
+}
+
 /** Prefers our own record of a substate's version over whatever the indexer just reported, when
  * we have a newer one — see the block comment above for why. */
-async function applyKnownVersions(inputs: SubstateRequirement[]): Promise<SubstateRequirement[]> {
+async function applyKnownVersions(inputs: SubstateRequirement[], network: Network): Promise<SubstateRequirement[]> {
   const known = await loadKnownVersions();
   return inputs.map((input) => {
-    const version = known.get(input.substate_id);
+    const version = known.get(versionKey(input.substate_id, network));
     return version !== undefined && (input.version === null || version > input.version) ? { ...input, version } : input;
   });
 }
@@ -4632,7 +4660,7 @@ export function dedupeInputs<T extends SubstateRequirement>(inputs: readonly T[]
 /** Remembers the post-transaction version of every substate a *confirmed* (never a dry-run —
  * those don't reflect real state) transaction touched, so the next transaction that references
  * one of them doesn't have to trust the indexer's possibly-stale view of it. */
-async function recordKnownVersions(response: IndexerGetTransactionResultResponse): Promise<void> {
+async function recordKnownVersions(response: IndexerGetTransactionResultResponse, network: Network): Promise<void> {
   const result = response.result;
   if (result === "Pending" || "Rejected" in result) return;
   const outcome = decodeExecuteResultDeep<ExecuteResult | null>(result.Finalized.execution_result)?.finalize.result;
@@ -4645,7 +4673,7 @@ async function recordKnownVersions(response: IndexerGetTransactionResultResponse
   if (!upSubstates || upSubstates.length === 0) return;
 
   const updates = new Map<string, number>();
-  for (const [id, substate] of upSubstates) updates.set(id, substate.version);
+  for (const [id, substate] of upSubstates) updates.set(versionKey(id, network), substate.version);
 
   // No extra `serialized()` wrap needed here (and one would deadlock: `setKnownVersions` below
   // already serializes its own write against storage.ts's shared queue, and queuing this whole
@@ -4682,11 +4710,11 @@ function withTransactionId<T extends IndexerGetTransactionResultResponse>(respon
  * remembered one is unusable. Keeping it would make `applyKnownVersions` reassert it over every
  * future resolve, turning one bad write into a permanently stuck wallet.
  */
-export async function forgetKnownVersions(substateIds: string[]): Promise<void> {
+export async function forgetKnownVersions(substateIds: string[], network?: Network): Promise<void> {
   if (substateIds.length === 0) return;
   const known = await loadKnownVersions();
   let changed = false;
-  for (const id of substateIds) if (known.delete(id)) changed = true;
+  for (const id of substateIds) if (known.delete(versionKey(id, network))) changed = true;
   if (changed) await setKnownVersions(Object.fromEntries(known));
 }
 

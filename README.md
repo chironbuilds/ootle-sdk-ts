@@ -74,6 +74,13 @@ Indexers come from the SDK's own table (`indexerUrlFor`): mainnet is
 `https://ootle-indexer-a.tari.com`, and Igor has none. Point a network elsewhere with
 `setIndexerUrl(Network.MainNet, url)` before creating accounts.
 
+Because the keys are the same, stored records are kept apart by network instead. An account's
+shielded outputs, scan cursors and watermarks, pending shields, reservations and HTLC journal live
+under `account.ledgerId`: `local:N` on a testnet (unchanged from earlier versions, so existing data
+needs no migration) and `mainnet:local:N` on mainnet. Read them with `account.ledgerId`, never
+`localAccountId(index)`. The substate version cache is split the same way, and
+`recoverPendingShields(provider, network)` only reconciles that network's pending shields.
+
 ### Claiming a Minotari (L1) burn
 
 A burn addressed to this account's public key (`getPublicKey()`) is claimed with `claimBurn`. Build
