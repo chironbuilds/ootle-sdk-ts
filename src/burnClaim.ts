@@ -10,11 +10,11 @@
 
 import type { MinotariBurnClaimProof } from "@tari-project/ootle-ts-bindings";
 
-/** What `OotleAccount.claimBurn()` consumes -- the wallet daemon's `ClaimBurnProofContents`. */
+/** What `OotleAccount.claimBurn()` consumes. */
 export interface BurnClaimProofContents {
   claim_proof: MinotariBurnClaimProof;
-  /** The burn output's encrypted value/mask, hex. */
-  encrypted_data: string;
+  /** @deprecated No longer used by claimBurn (Ootle 0.52 ClaimBurn yields a revealed bucket). */
+  encrypted_data?: string;
 }
 
 /**
@@ -268,7 +268,7 @@ export function assembleBurnClaimProof(parts: L1BurnProofParts, outputProof: Bur
     { public_nonce: parts.ownershipNonceHex, signature: parts.ownershipSignatureHex },
     parts.amount
   );
-  return { claim_proof: claim, encrypted_data: bytesToHex(hexToBytes(parts.encryptedDataHex, "encryptedDataHex")) };
+  return { claim_proof: claim };
 }
 
 function base64ToHex(b64: string): string {
@@ -292,20 +292,15 @@ export function parseConsoleWalletBurnProof(json: string | Record<string, unknow
     } & Partial<MinotariBurnClaimProof>;
     encrypted_data?: string | number[];
   };
-  if (!file.claim_proof || file.encrypted_data === undefined) {
-    throw new Error("Not a burn proof: expected `claim_proof` and `encrypted_data`");
+  if (!file.claim_proof) {
+    throw new Error("Not a burn proof: expected `claim_proof`");
   }
-  const encrypted = Array.isArray(file.encrypted_data)
-    ? file.encrypted_data.map((b) => b.toString(16).padStart(2, "0")).join("")
-    : /^[0-9a-f]+$/i.test(file.encrypted_data) && file.encrypted_data.length % 2 === 0
-      ? file.encrypted_data.toLowerCase()
-      : base64ToHex(file.encrypted_data);
   const cp = file.claim_proof;
   if (cp.output_proof) {
     if (!cp.ownership_proof || cp.value === undefined) throw new Error("Burn proof is missing its ownership proof or value");
-    return { claim_proof: claimProofFromL1(cp.output_proof, cp.ownership_proof, cp.value), encrypted_data: encrypted };
+    return { claim_proof: claimProofFromL1(cp.output_proof, cp.ownership_proof, cp.value) };
   }
-  if (cp.inclusion_proof && cp.output) return { claim_proof: cp as MinotariBurnClaimProof, encrypted_data: encrypted };
+  if (cp.inclusion_proof && cp.output) return { claim_proof: cp as MinotariBurnClaimProof };
   throw new Error(
     "This burn proof predates Ootle 0.42 (it proves the burn kernel, not the burn output). Regenerate it with a " +
       "Minotari 6.0.1+ wallet, or claim the burn from its commitment."

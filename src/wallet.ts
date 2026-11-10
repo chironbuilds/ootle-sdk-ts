@@ -3618,12 +3618,6 @@ export class OotleAccount implements WalletAccountApi {
     }
 
     const crypto = new WasmStealthCrypto(this.network);
-    const aeadKey = await crypto.deriveAeadKey(this.ownerSecret, senderOffset);
-    const decrypted = await crypto.unblindOutput(burnCommitment, fromHex(contents.encrypted_data), aeadKey, true);
-    if (decrypted.value !== value) {
-      throw new Error(`claimBurn: burn proof states ${value} but the burn output holds ${decrypted.value}`);
-    }
-
     const provider = await this.getProvider();
     const walletAddress = await this.getWalletAddress();
     // The claim's only signer, so it is also the receiver of the revealed fee (tari-ootle#2645).
@@ -3632,18 +3626,17 @@ export class OotleAccount implements WalletAccountApi {
     // One claim transaction revealing `fee`. The output statement encodes the revealed amount, so
     // every fee needs its own statement and proofs.
     const buildClaim = async (fee: bigint, dryRun: boolean) => {
-      const claimedAmount = decrypted.value - fee;
+      const claimedAmount = value - fee;
       if (claimedAmount <= 0n) {
-        throw new Error(`claimBurn: the burn (${decrypted.value}) does not cover the claim fee (${fee})`);
+        throw new Error(`claimBurn: the burn (${value}) does not cover the claim fee (${fee})`);
       }
       const output = createOutput({ destination: walletAddress, amount: claimedAmount, resourceAddress: TARI_RESOURCE_ADDRESS, memo: toMemo(memo) });
       const { statement: outputsStatement, outputMask } = await crypto.generateOutputsStatement([output], fee > 0n ? { amount: fee, receiver: sealKeypair.public_key } : null);
-      // The single input is the UTXO `ClaimBurn` mints in the same transaction; the instruction
-      // itself authorises spending it, so it carries no witness.
-      const inputsStatement = await crypto.buildInputsStatement([new StealthInput(burnCommitment)], 0n);
-      const inputMask = await crypto.aggregateInputMasks([decrypted.mask]);
+      // ClaimBurn (0.52+) yields a revealed bucket; the inputs statement encodes that as a
+      // revealed-only input (no stealth commitment or mask).
+      const inputsStatement = await crypto.buildInputsStatement([], value);
       const balanceProof = await crypto.generateBalanceProofSignature(
-        inputMask,
+        Mask.zero(),
         outputMask,
         inputsStatement.statementJson!,
         outputsStatement.statementJson
@@ -3654,16 +3647,20 @@ export class OotleAccount implements WalletAccountApi {
 
       const maxEpoch = await resolveMaxEpoch(provider);
       const builder = TransactionBuilder.new(this.network, maxEpoch)
-        .addFeeInstruction({ ClaimBurn: { claim: proof, output_data: { encrypted_data: contents.encrypted_data } } } as unknown as Instruction)
+        // ClaimBurn yields a revealed bucket (0.52+); no output_data.
+        .addFeeInstruction({ ClaimBurn: { claim: proof } } as unknown as Instruction)
+        // Save the claim bucket in workspace slot 0 so StealthTransfer can consume it.
+        .addFeeInstruction({ PutLastInstructionOutputOnWorkspace: { key: 0 } } as unknown as Instruction)
         .addFeeInstruction({
           StealthTransfer: {
             resource_address_ref: { Address: TARI_RESOURCE_ADDRESS },
             statement: { __ootleRawJson: statement.toCompactJson() },
-            revealed_input_bucket: null,
+            // Take the revealed bucket (slot 0) as the input.
+            revealed_input_bucket: { id: 0, offset: null },
           },
         } as unknown as Instruction)
-        .addFeeInstruction({ PutLastInstructionOutputOnWorkspace: { key: 0 } } as unknown as Instruction)
-        .addFeeInstruction({ PayFeeFromBucket: { bucket: { id: 0, offset: null } } } as unknown as Instruction)
+        .addFeeInstruction({ PutLastInstructionOutputOnWorkspace: { key: 1 } } as unknown as Instruction)
+        .addFeeInstruction({ PayFeeFromBucket: { bucket: { id: 1, offset: null } } } as unknown as Instruction)
         .addInput({ substate_id: TARI_RESOURCE_ADDRESS, version: null, is_write: false });
       // The seal key `s` is the transaction's only signer, so it must be authorized as the main
       // signer; the TS builder leaves that off by default.
@@ -3676,7 +3673,7 @@ export class OotleAccount implements WalletAccountApi {
       return { envelope: sealTransaction(signed), claimedAmount, ownCommitment };
     };
 
-    return { buildClaim, value: decrypted.value, provider };
+    return { buildClaim, value, provider };
   }
 
   /** Dry-runs a sealed claim and returns the fee it needs: what it was charged plus the allowance. */

@@ -61,12 +61,11 @@ describe("L1 burn output proof conversion (vs claim_proof_from_l1)", () => {
 
 describe("L1 burn claims", () => {
   it("assembles the proof in Ootle's serde shape", () => {
-    const { claim_proof, encrypted_data } = assembleBurnClaimProof(parts(), outputProof());
+    const { claim_proof } = assembleBurnClaimProof(parts(), outputProof());
     expect(claim_proof.commitment).toBe(fixture.commitmentHex);
     expect(claim_proof.ownership_proof).toEqual({ public_nonce: fixture.ownershipNonceHex, signature: fixture.ownershipSignatureHex });
     expect(claim_proof.value).toBe(String(fixture.amount));
     expect(claim_proof.inclusion_proof.block_hash).toBe(vectors[0]!.base_node_proof.block_hash);
-    expect(encrypted_data).toBe(fixture.encryptedDataHex);
   });
 
   it("refuses an output proof for a different commitment", () => {
@@ -115,7 +114,7 @@ describe("L1 burn claims", () => {
     ).toBe(false);
   });
 
-  it("reads a minotari_console_wallet proof file (base64 encrypted_data)", () => {
+  it("reads a minotari_console_wallet proof file (base64 encrypted_data ignored)", () => {
     const { claim_proof } = assembleBurnClaimProof(parts(), outputProof());
     const b64 = btoa(String.fromCharCode(...fromHex(fixture.encryptedDataHex)));
     const file = {
@@ -129,7 +128,6 @@ describe("L1 burn claims", () => {
       mined_in_epoch: 3,
     };
     const parsed = parseConsoleWalletBurnProof(JSON.stringify(file));
-    expect(parsed.encrypted_data).toBe(fixture.encryptedDataHex);
     expect(parsed.claim_proof).toEqual(claim_proof);
   });
 
