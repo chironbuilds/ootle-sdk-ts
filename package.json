@@ -26,6 +26,10 @@
     "./adapters": {
       "types": "./dist/adapters.d.ts",
       "default": "./dist/adapters.js"
+    },
+    "./walletconnect": {
+      "types": "./dist/walletconnect/index.d.ts",
+      "default": "./dist/walletconnect/index.js"
     }
   },
   "files": [
@@ -51,7 +55,16 @@
   },
   "devDependencies": {
     "@types/chrome": "^0.0.280",
+    "@walletconnect/universal-provider": "^2.26.0",
     "typescript": "^5.6.0",
     "vitest": "^4.1.0"
+  },
+  "peerDependencies": {
+    "@walletconnect/universal-provider": "^2.26.0"
+  },
+  "peerDependenciesMeta": {
+    "@walletconnect/universal-provider": {
+      "optional": true
+    }
   }
 }
