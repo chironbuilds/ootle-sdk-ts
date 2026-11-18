@@ -16,6 +16,7 @@ import {
   resolveUnshieldPlan,
   selectPrivateFeeUtxo,
   isSpentElsewhere,
+  isUtxoDown,
   transactionOutcome,
   selectShieldedUtxosForAmount,
   selectUnspentShieldedOutputs,
@@ -604,6 +605,28 @@ describe("isSpentElsewhere", () => {
   it("never counts a server or network error", () => {
     expect(isSpentElsewhere(old, new Error("HTTP 500: internal error"), now)).toBe(false);
     expect(isSpentElsewhere(old, new TypeError("Failed to fetch"), now)).toBe(false);
+  });
+  it("believes \"is down\" at once, even for a fresh record", () => {
+    const down = new Error('HTTP 404:  - {"error":"Input substate utxo_01_ab (v0) is down"}');
+    expect(isSpentElsewhere(fresh, down, now)).toBe(true);
+  });
+});
+
+describe("isUtxoDown", () => {
+  // The indexer's answer for a spent stealth UTXO (Esmeralda, 2026-11-19), and a rejected spend of one.
+  const read = new Error('HTTP 404:  - {"error":"Input substate utxo_0101_54a6196a6f27 (v0) is down"}');
+  const lock = new Error("Transaction was rejected: Lock failure: Substate utxo_0101_54A6196A6F27:0 is DOWN");
+  it("recognises a spent UTXO from a read or a rejected transaction", () => {
+    expect(isUtxoDown(read)).toBe(true);
+    expect(isUtxoDown(lock)).toBe(true);
+  });
+  it("matches the named commitment only, case-insensitively", () => {
+    expect(isUtxoDown(lock, "54a6196a6f27")).toBe(true);
+    expect(isUtxoDown(lock, "ffffffffffff")).toBe(false);
+  });
+  it("doesn't treat not-found or server errors as spent", () => {
+    expect(isUtxoDown(new Error('HTTP 404: {"error":"Substate utxo_01_ab not found"}'))).toBe(false);
+    expect(isUtxoDown(new Error("HTTP 500: internal error"))).toBe(false);
   });
 });
 

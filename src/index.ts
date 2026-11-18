@@ -102,6 +102,8 @@ export {
   recoverPendingShields,
   FeeCommittedError,
   FeeBookkeepingError,
+  SpentFeeInputError,
+  isUtxoDown,
   resetKnownVersions,
   resolveInputsWithRetry,
   resolveSendPrivatelyPlan,

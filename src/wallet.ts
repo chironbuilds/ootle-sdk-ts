@@ -152,6 +152,19 @@ export class FeeCommittedError extends Error {
   }
 }
 
+/** The UTXO picked to pay a private fee turned out to be already spent on chain. It has been marked
+ * spent (so it is gone from the balance and won't be picked again); the operation did not happen and
+ * can simply be tried again, which pays from another UTXO. */
+export class SpentFeeInputError extends Error {
+  constructor(readonly original: unknown) {
+    super(
+      "The private UTXO picked to pay the fee had already been spent, so nothing was sent. It has been removed from your balance; try again to pay from another one.",
+      { cause: original },
+    );
+    this.name = "SpentFeeInputError";
+  }
+}
+
 /** The fee committed on-chain but recording it locally failed; the pending entry must be kept so
  * `recoverPendingShields()` can finish the job. */
 export class FeeBookkeepingError extends Error {
@@ -735,7 +748,7 @@ export class OotleAccount implements WalletAccountApi {
     // depend on which main-instruction substates a given attempt discovers, so redoing the
     // indexer round trip + proof generation on every retry would buy nothing.
     const accountId = this.ledgerId;
-    const privateFee = await this.resolvePrivateFee(feeType, maxFee);
+    let privateFee = await this.resolvePrivateFee(feeType, maxFee);
 
     for (let attempt = 0; ; attempt++) {
       const builder = TransactionBuilder.new(this.network, maxEpoch).withInstructions(instructions);
@@ -770,6 +783,14 @@ export class OotleAccount implements WalletAccountApi {
           throw e;
         }
         if (!(e instanceof Error) || attempt >= maxRetries) throw e;
+
+        // The fee's UTXO was already spent (this ledger was behind the chain): drop it and pay from
+        // another one. Checked before the "Lock failure" handling below, which would otherwise try
+        // the next version of a UTXO that will never have one.
+        if (privateFee && (await this.noteSpentFeeInput(accountId, privateFee, e))) {
+          privateFee = await this.resolvePrivateFee(feeType, maxFee, [privateFee.spentCommitment]);
+          continue;
+        }
 
         // No amount of retrying fixes an empty fee vault — surface this immediately instead of
         // burning the retry budget re-discovering the same "insufficient balance" outcome.
@@ -1980,6 +2001,7 @@ export class OotleAccount implements WalletAccountApi {
     try {
       return await poll();
     } catch (e) {
+      if (await this.noteSpentFeeInput(accountId, privateFee, e)) throw new SpentFeeInputError(e);
       if (e instanceof FeeCommittedError && privateFee && feeType.kind === "private") {
         try {
           await this.recordPrivateFeeSpend(accountId, feeType.feeResourceAddress, privateFee, transactionId);
@@ -2012,15 +2034,13 @@ export class OotleAccount implements WalletAccountApi {
     const accountId = this.ledgerId;
     const records = await listShieldedOutputs(accountId);
     for (const unavailable of await this.unavailableCommitments(accountId, reservationHolder)) exclude = [...exclude, unavailable];
-    // Retries with the next-smallest qualifying UTXO if one fails to read -- confirmed live that a
-    // record this wallet still has as "unspent" can 500 on the indexer (consistent with it having
-    // actually been spent already, e.g. from another device/session sharing this seed, hitting an
-    // indexer bug serving a since-spent substate) rather than a clean not-found. Deliberately does
-    // NOT mark a failing candidate spent here: a 500 doesn't distinguish "genuinely spent" from "the
-    // indexer had a bad moment," and this wallet's only handle back to a real stealth output is this
-    // local record (see `ShieldedOutputRecord`'s own doc comment) -- wrongly deleting one on an
-    // ambiguous error is unrecoverable, so a failing candidate is only skipped for *this* attempt,
-    // tried again next time. Bounded by the exclude set strictly growing each iteration.
+    // Retries with the next-smallest qualifying UTXO if one fails to read. A candidate the chain
+    // says is spent ("is down", or not found once past the grace period -- see `isSpentElsewhere`)
+    // is marked spent (as "inferred", so it is revived if it is ever seen live again), which also
+    // drops it from the balance. Any other failure (a 500, a network error) says nothing about the
+    // UTXO: it is only skipped for *this* attempt and tried again next time, since this wallet's only
+    // handle back to a real stealth output is this local record (see `ShieldedOutputRecord`).
+    // Bounded by the exclude set strictly growing each iteration.
     const tried = new Set(exclude);
     let lastReadError: unknown;
     for (;;) {
@@ -2057,8 +2077,20 @@ export class OotleAccount implements WalletAccountApi {
       } catch (e) {
         lastReadError = e;
         tried.add(chosen.commitment);
+        if (isSpentElsewhere(chosen, e)) await markShieldedOutputSpent(accountId, chosen.commitment, "inferred");
       }
     }
+  }
+
+  /**
+   * After a submission fails: if the reason is that the private fee's own UTXO is already spent on
+   * chain (from another device on this seed, or a spend this ledger never saw), marks it spent so it
+   * leaves the balance and is never picked again. Returns whether that was the reason.
+   */
+  private async noteSpentFeeInput(accountId: string, privateFee: PrivateFeeMaterial | null, error: unknown): Promise<boolean> {
+    if (!privateFee || !isUtxoDown(error, privateFee.spentCommitment)) return false;
+    await markShieldedOutputSpent(accountId, privateFee.spentCommitment, "inferred");
+    return true;
   }
 
   /**
@@ -2328,7 +2360,13 @@ export class OotleAccount implements WalletAccountApi {
       excludeFromFeeSelection,
       reservationHolder,
     });
-    const transactionId = await submitTransaction(provider, envelope);
+    let transactionId: string;
+    try {
+      transactionId = await submitTransaction(provider, envelope);
+    } catch (e) {
+      if (await this.noteSpentFeeInput(this.ledgerId, privateFee, e)) throw new SpentFeeInputError(e);
+      throw e;
+    }
     return { transactionId, spec, privateFee };
   }
 
@@ -2373,7 +2411,14 @@ export class OotleAccount implements WalletAccountApi {
     } else {
       withFee = builder.payFeeFromRevealed(maxFee);
     }
-    const spec = await withFee.prepare();
+    let spec: StealthTransferSpec;
+    try {
+      spec = await withFee.prepare();
+    } catch (e) {
+      // Resolving inputs is where a spent fee UTXO shows up ("Failed to find input … is down").
+      if (await this.noteSpentFeeInput(this.ledgerId, privateFee, e)) throw new SpentFeeInputError(e);
+      throw e;
+    }
     // Collapse duplicate inputs before the wasm ever sees the transaction: a private fee paid in the
     // same resource the operation itself spends adds that resource twice, which 0.47 rejects whole
     // (see `dedupeInputs`). Done on the spec the authorizer then signs, so every signature covers
@@ -2394,6 +2439,7 @@ export class OotleAccount implements WalletAccountApi {
         ...(opts.authorizerOpts ?? {}),
       }).prepare(provider);
     } catch (e) {
+      if (await this.noteSpentFeeInput(this.ledgerId, privateFee, e)) throw new SpentFeeInputError(e);
       throw new Error(
         `${e instanceof Error ? e.message : String(e)} — at WalletStealthAuthorizer.prepare; tx: ${describeResolvedTx(spec.unsignedTx)}`,
         { cause: e },
@@ -4371,8 +4417,22 @@ const SPENT_ELSEWHERE_GRACE_MS = 10 * 60_000;
  * nothing about the UTXO and never counts.
  */
 export function isSpentElsewhere(record: Pick<ShieldedOutputRecord, "createdAt">, error: unknown, now = Date.now()): boolean {
+  if (isUtxoDown(error)) return true;
   const message = error instanceof Error ? error.message : String(error);
   return /\b404\b|not found/i.test(message) && now - record.createdAt >= SPENT_ELSEWHERE_GRACE_MS;
+}
+
+/**
+ * Whether an error says a UTXO has been consumed on chain. The indexer answers a read of a spent
+ * stealth UTXO with "Input substate utxo_… (v0) is down", and a transaction that tries to spend one
+ * fails with "… is DOWN". Unlike "not found" (which a brand-new output can also give for a moment),
+ * this only ever means spent, so it needs no grace period. Pass `commitmentHex` to also require the
+ * message to name that UTXO.
+ */
+export function isUtxoDown(error: unknown, commitmentHex?: string): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  if (!/\bis down\b/i.test(message)) return false;
+  return commitmentHex === undefined || message.toLowerCase().includes(commitmentHex.toLowerCase());
 }
 
 /** Whether a stealth UTXO no longer exists (the indexer says not found). Any other failure: assume it does. */
