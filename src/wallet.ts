@@ -126,6 +126,7 @@ import {
 } from "./storage.js";
 import type { HtlcJournalEntry, PrivatePaymentScanResume, ShieldedOutputRecord } from "./storage.js";
 import { withTimeout } from "./timeout.js";
+import { canonicalNonFungibleId, nonFungibleIdLiteral, nonFungibleIdsLiteral } from "./nonFungibleId.js";
 import { scanUtxosDelta, scanUtxosPage } from "./utxoScan.js";
 import type { UtxoScanWatermark } from "./utxoScan.js";
 import { fromHex, toHex } from "./vault.js";
@@ -255,6 +256,11 @@ export interface TokenBalance {
    * A NonFungible vault's container has no `.amount`/`.revealed_amount` field at all (only
    * `token_ids`/`locked_token_ids`), so `amount` above is synthesized as this array's length. */
   nonFungibleTokenIds: string[] | null;
+  /** The same tokens as `nonFungibleTokenIds`, in the engine's canonical typed form (`u64_5`,
+   * `str_name`, `uuid_<hex>`, see nonFungibleId.ts), which `sendNonFungibles` takes. Null for every
+   * other kind. A token whose id couldn't be read is left out here (and so can't be sent), never
+   * given a guessed type. */
+  nonFungibleIds: string[] | null;
 }
 
 /** One resource's total unspent *stealth* holding -- `OotleAccount.getPrivateBalances()`'s element
@@ -593,6 +599,7 @@ export class OotleAccount implements WalletAccountApi {
       amount: bigint;
       commitments?: Record<string, OutputBody>;
       nonFungibleTokenIds?: string[];
+      nonFungibleIds?: string[];
     }[] = [];
     if (vaultIds.length > 0) {
       const { substates } = await withTimeout(fetchSubstatesDecoded(provider, vaultIds), 15_000, "fetching vault balances");
@@ -603,8 +610,10 @@ export class OotleAccount implements WalletAccountApi {
         const container = value.Vault.resource_container;
         const [kind, data] = Object.entries(container)[0] as [string, Record<string, unknown>];
         if (kind === "NonFungible") {
-          const tokenIds = ((data.token_ids as unknown[]) ?? []).map(stringifyNonFungibleId);
-          parsed.push({ resourceAddress: data.address as string, kind, amount: BigInt(tokenIds.length), nonFungibleTokenIds: tokenIds });
+          const raw = (data.token_ids as unknown[]) ?? [];
+          const tokenIds = raw.map(stringifyNonFungibleId);
+          const canonical = raw.map(canonicalNonFungibleId).filter((c): c is string => c !== null);
+          parsed.push({ resourceAddress: data.address as string, kind, amount: BigInt(tokenIds.length), nonFungibleTokenIds: tokenIds, nonFungibleIds: canonical });
           continue;
         }
         const rawAmount = (data.amount ?? data.revealed_amount ?? 0) as string | number | bigint;
@@ -649,6 +658,7 @@ export class OotleAccount implements WalletAccountApi {
       symbol: symbolByResource.get(p.resourceAddress) ?? null,
       name: nameByResource.get(p.resourceAddress) ?? null,
       nonFungibleTokenIds: p.nonFungibleTokenIds ?? null,
+      nonFungibleIds: p.nonFungibleIds ?? null,
     }));
 
     // Resources whose only balance is a shielded output with no on-chain vault at all (e.g.
@@ -975,6 +985,48 @@ export class OotleAccount implements WalletAccountApi {
   async send(recipientAddress: string, resourceAddress: string, amount: bigint, maxFee = 5000n, feeType: FeeType = { kind: "transparent" }) {
     if (amount <= 0n) throw new Error(`send: amount must be greater than zero, got ${amount}`);
     const account = await this.getComponentAddress();
+    const { recipient, instructions } = await this.recipientAccount(recipientAddress);
+    instructions.push(
+      { CallMethod: { call: { Address: account }, method: "withdraw", args: [resourceAddressLiteral(resourceAddress), amountLiteral(amount)] } },
+      { PutLastInstructionOutputOnWorkspace: { key: 0 } },
+      { CallMethod: { call: { Address: recipient }, method: "deposit", args: [{ Workspace: { id: 0, offset: null } }] } },
+    );
+    return this.execute(instructions, { maxFee, feeType });
+  }
+
+  /**
+   * Transfers specific NFTs of `resourceAddress` from this account to `recipientAddress`: the
+   * account template's `withdraw_non_fungible` (one token) or `withdraw_many_non_fungibles`
+   * (several), handed to the recipient's `deposit` exactly as `send()` hands over a fungible bucket,
+   * and with the same recipient handling (wallet or component address; a missing account is
+   * created when a wallet address was given).
+   *
+   * `ids` are canonical ids (`u64_5`, `str_name`, `uuid_<hex>`), as `getBalances()` reports them in
+   * `nonFungibleIds`: the type is part of the token's identity, so a bare "5" can't be sent.
+   */
+  async sendNonFungibles(recipientAddress: string, resourceAddress: string, ids: string[], maxFee = 5000n, feeType: FeeType = { kind: "transparent" }) {
+    if (ids.length === 0) throw new Error("sendNonFungibles: choose at least one NFT to send");
+    if (new Set(ids).size !== ids.length) throw new Error("sendNonFungibles: the same NFT is listed twice");
+    const account = await this.getComponentAddress();
+    const { recipient, instructions } = await this.recipientAccount(recipientAddress);
+    const withdraw: Instruction =
+      ids.length === 1
+        ? { CallMethod: { call: { Address: account }, method: "withdraw_non_fungible", args: [resourceAddressLiteral(resourceAddress), nonFungibleIdLiteral(ids[0]!)] } }
+        : { CallMethod: { call: { Address: account }, method: "withdraw_many_non_fungibles", args: [resourceAddressLiteral(resourceAddress), nonFungibleIdsLiteral(ids)] } };
+    instructions.push(
+      withdraw,
+      { PutLastInstructionOutputOnWorkspace: { key: 0 } },
+      { CallMethod: { call: { Address: recipient }, method: "deposit", args: [{ Workspace: { id: 0, offset: null } }] } },
+    );
+    return this.execute(instructions, { maxFee, feeType });
+  }
+
+  /**
+   * The recipient's account component, plus a `CreateAccount` instruction first when a wallet
+   * address names an account that doesn't exist on-chain yet (see `send()`'s doc comment for why
+   * it is only created when genuinely missing, and never for a bare component address).
+   */
+  private async recipientAccount(recipientAddress: string): Promise<{ recipient: string; instructions: Instruction[] }> {
     const isWalletAddress = recipientAddress.startsWith("otl");
     if (isWalletAddress) this.assertSameNetwork(recipientAddress, "The recipient");
     const recipient = isWalletAddress ? componentAddressFromWalletAddress(recipientAddress) : recipientAddress;
@@ -999,13 +1051,7 @@ export class OotleAccount implements WalletAccountApi {
         });
       }
     }
-
-    instructions.push(
-      { CallMethod: { call: { Address: account }, method: "withdraw", args: [resourceAddressLiteral(resourceAddress), amountLiteral(amount)] } },
-      { PutLastInstructionOutputOnWorkspace: { key: 0 } },
-      { CallMethod: { call: { Address: recipient }, method: "deposit", args: [{ Workspace: { id: 0, offset: null } }] } },
-    );
-    return this.execute(instructions, { maxFee, feeType });
+    return { recipient, instructions };
   }
 
   /**
@@ -4241,6 +4287,7 @@ export function synthesizeShieldedOnlyBalances(
       symbol: symbolByResource.get(resourceAddress) ?? null,
       name: nameByResource.get(resourceAddress) ?? null,
       nonFungibleTokenIds: null,
+      nonFungibleIds: null,
     });
   }
   return balances;

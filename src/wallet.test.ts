@@ -456,6 +456,7 @@ describe("synthesizeShieldedOnlyBalances", () => {
       symbol: "GHOST",
       name: "Ghost Token",
       nonFungibleTokenIds: null,
+      nonFungibleIds: null,
     });
   });
 

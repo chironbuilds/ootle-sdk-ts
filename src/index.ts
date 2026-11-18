@@ -38,6 +38,9 @@ export {
   verifyHtlcTerms,
 } from "./htlcSafety.js";
 
+export type { ParsedNonFungibleId } from "./nonFungibleId.js";
+export { canonicalNonFungibleId, displayNonFungibleId, nonFungibleIdLiteral, nonFungibleIdsLiteral, parseNonFungibleId } from "./nonFungibleId.js";
+
 export type { NetworkName } from "./ootleNetwork.js";
 export { NETWORK_NAMES, indexerUrlFor, isNetworkName, isTestnet, networkNameFromByte, setIndexerUrl, toOotleNetwork } from "./ootleNetwork.js";
 

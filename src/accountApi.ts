@@ -35,5 +35,8 @@ export interface WalletAccountApi {
    * reveals it, so that form can only pay an account that already exists). Prefer asking senders
    * for the wallet address — it's the one form that always works. */
   send(recipientAddress: string, resourceAddress: string, amount: bigint, maxFee?: bigint, feeType?: FeeType): Promise<unknown>;
+  /** Sends specific NFTs (canonical ids, see `TokenBalance.nonFungibleIds`). Optional: a backend
+   * that can't move individual tokens leaves it out, and callers hide NFT sending for it. */
+  sendNonFungibles?(recipientAddress: string, resourceAddress: string, ids: string[], maxFee?: bigint, feeType?: FeeType): Promise<unknown>;
   claimTestnetXtr(): Promise<unknown>;
 }
