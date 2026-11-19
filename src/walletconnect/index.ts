@@ -1,5 +1,6 @@
 export {
   createWalletConnectProvider,
+  DEFAULT_WC_PROJECT_ID,
   sapientDeepLink,
   accountsOnChain,
   type TariWalletConnectOptions,

@@ -3,7 +3,7 @@
 // so a dApp that already talks to window.tari can switch transports without touching its calls:
 //
 //   import { createWalletConnectProvider } from "@chironbuilder/ootle-sdk/walletconnect";
-//   const tari = await createWalletConnectProvider({ projectId, network: "mainnet", metadata,
+//   const tari = await createWalletConnectProvider({ network: "mainnet", metadata,
 //     onDisplayUri: (uri) => showQr(uri) });
 //   const [address] = await tari.connect();
 //   const balances = await tari.request({ method: "tari_getBalances" });
@@ -22,9 +22,15 @@ export interface TariWalletConnectMetadata {
   icons: string[];
 }
 
+/**
+ * Shared Reown project id used when a dApp doesn't pass its own. Fine for trying things out; in production pass
+ * your own (free at cloud.reown.com) for your own relay quota and so Reown Verify can mark your domain verified.
+ */
+export const DEFAULT_WC_PROJECT_ID = "8bb31c50def7dc5a660461ff56b86588";
+
 export interface TariWalletConnectOptions {
-  /** Reown (WalletConnect) Cloud project id for this dApp. */
-  projectId: string;
+  /** Reown (WalletConnect) Cloud project id for this dApp. Optional; defaults to DEFAULT_WC_PROJECT_ID. */
+  projectId?: string;
   /** The network the dApp runs on. The wallet refuses the session if it is on another one. */
   network: NetworkName;
   metadata: TariWalletConnectMetadata;
@@ -72,7 +78,7 @@ export async function createWalletConnectProvider(options: TariWalletConnectOpti
   // network change (a tari_switchNetwork the user approved moves the session to the new chain).
   let chain = wcChainId(options.network);
   const provider = await UniversalProvider.init({
-    projectId: options.projectId,
+    projectId: options.projectId || DEFAULT_WC_PROJECT_ID,
     metadata: options.metadata,
     relayUrl: options.relayUrl,
   });
