@@ -1931,15 +1931,7 @@ export class OotleAccount implements WalletAccountApi {
     const feeSubstate = await getSubstateDecoded(provider, substateId);
     const feeNonce = utxoOf(feeSubstate).output
       .output.public_nonce;
-    const feeSigner: Signer = {
-      getAddress: async () => walletAddress,
-      getPublicKey: async () => parseOotleAddress(walletAddress).owner_key,
-      signTransaction: async (tx: UnsignedTransactionWithBlobs, sealPublicKey: Uint8Array) => {
-        const json = serializeUnsignedTx(tx);
-        const sig = await this.signer.addStealthSignature!(json, fromHex(feeNonce), sealPublicKey, { crypto, viewSecret: await this.signer.getViewSecret() });
-        return [sig];
-      },
-    };
+    const feeSigner = this.stealthInputSigner(walletAddress, crypto, feeNonce, utxoSpendKey(feeSubstate));
 
     return { feeInstructions, feeInputs, feeChangeCommitment, feeChangeAmount: feeChange, feeSigner };
   }
@@ -1970,9 +1962,37 @@ export class OotleAccount implements WalletAccountApi {
    */
   private async sealWithPrivateFee(authorized: AuthorizedTransfer, feeSigner: Signer) {
     const sealPublicKey = authorized.getSealPublicKey();
-    const signatures = await feeSigner.signTransaction(authorized.getSpec().unsignedTx, sealPublicKey);
+    // Schema V2: every authorization commits to the whole authorizer set, so the fee UTXO's
+    // one-time key must join the set before it is fixed (the first `getAuthorizerPublicKeys`).
+    for (const key of await feeSigner.getAuthorizerPublicKeys!()) authorized.addAuthorizer(key);
+    const authorizers = await authorized.getAuthorizerPublicKeys();
+    const signatures = await feeSigner.signTransaction(authorized.getSpec().unsignedTx, sealPublicKey, authorizers);
     for (const signature of signatures) authorized.addSignature(signature);
     return authorized.seal();
+  }
+
+  /**
+   * A `Signer` for one stealth input spent by key path: it signs with the UTXO's one-time spend key
+   * (derived from the owner secret, view secret and the output's public nonce). Under transaction
+   * schema V2 (Ootle 0.55) each authorization commits to the transaction's full authorizer set, so
+   * the signer declares that one-time key -- not the account owner key -- as its authorizer key.
+   */
+  private stealthInputSigner(walletAddress: string, crypto: WasmStealthCrypto, publicNonceHex: string, spendKey: Uint8Array): Signer {
+    return {
+      getAddress: async () => walletAddress,
+      getPublicKey: async () => spendKey,
+      getAuthorizerPublicKeys: async () => [spendKey],
+      signTransaction: async (tx: UnsignedTransactionWithBlobs, sealPublicKey: Uint8Array, authorizers: Uint8Array[]) => {
+        const json = serializeUnsignedTx(tx);
+        return [
+          await this.signer.addStealthSignature!(json, fromHex(publicNonceHex), sealPublicKey, {
+            crypto,
+            viewSecret: await this.signer.getViewSecret(),
+            authorizers,
+          }),
+        ];
+      },
+    };
   }
 
   /**
@@ -2176,7 +2196,7 @@ export class OotleAccount implements WalletAccountApi {
           if (!decrypted) throw new Error(`sendPrivately: cannot decrypt ${substateId} -- it isn't this account's, or it is already spent.`);
           const nonce = utxoOf(substate).output.output
             .public_nonce;
-          return { commitmentHex, substateId, mask: decrypted.mask, nonce, value: decrypted.value };
+          return { commitmentHex, substateId, mask: decrypted.mask, nonce, spendKey: utxoSpendKey(substate), value: decrypted.value };
         })
       );
       const total = inputs.reduce((sum, i) => sum + i.value, 0n);
@@ -2221,14 +2241,7 @@ export class OotleAccount implements WalletAccountApi {
         unsignedBody.dry_run = dryRun;
         const unsignedTx = await resolveTransaction(provider, unsignedBody);
         unsignedTx.inputs = dedupeInputs(unsignedTx.inputs);
-        const signers: Signer[] = inputs.map((input) => ({
-          getAddress: async () => walletAddress,
-          getPublicKey: async () => parseOotleAddress(walletAddress).owner_key,
-          signTransaction: async (tx: UnsignedTransactionWithBlobs, sealPublicKey: Uint8Array) => {
-            const json = serializeUnsignedTx(tx);
-            return [await this.signer.addStealthSignature!(json, fromHex(input.nonce), sealPublicKey, { crypto, viewSecret: await this.signer.getViewSecret() })];
-          },
-        }));
+        const signers: Signer[] = inputs.map((input) => this.stealthInputSigner(walletAddress, crypto, input.nonce, input.spendKey));
         const signed = await signTransaction(signers, unsignedTx, sealKeypair);
         return {
           envelope: sealTransaction(signed),
@@ -2575,15 +2588,7 @@ export class OotleAccount implements WalletAccountApi {
     const redeemedSubstate = await getSubstateDecoded(provider, redeemed.substateId);
     const redeemedNonce = utxoOf(redeemedSubstate)
       .output.output.public_nonce;
-    const redeemedSigner: Signer = {
-      getAddress: async () => walletAddress,
-      getPublicKey: async () => parseOotleAddress(walletAddress).owner_key,
-      signTransaction: async (tx: UnsignedTransactionWithBlobs, sealPublicKey: Uint8Array) => {
-        const json = serializeUnsignedTx(tx);
-        const sig = await this.signer.addStealthSignature!(json, fromHex(redeemedNonce), sealPublicKey, { crypto, viewSecret: await this.signer.getViewSecret() });
-        return [sig];
-      },
-    };
+    const redeemedSigner = this.stealthInputSigner(walletAddress, crypto, redeemedNonce, utxoSpendKey(redeemedSubstate));
 
     const signed = await signTransaction([redeemedSigner, feeSigner], unsignedTx);
     const envelope = sealTransaction(signed);
@@ -3469,7 +3474,7 @@ export class OotleAccount implements WalletAccountApi {
         const decrypted = await decryptOwnedUtxo(crypto, viewSecret, substate, substateId);
         if (!decrypted) throw new Error(`unshield: cannot decrypt ${substateId} -- it isn't this account's, or it is already spent.`);
         const nonce = utxoOf(substate).output.output.public_nonce;
-        return { commitmentHex, substateId, mask: decrypted.mask, nonce };
+        return { commitmentHex, substateId, mask: decrypted.mask, nonce, spendKey: utxoSpendKey(substate) };
       })
     );
     const inputMask = await crypto.aggregateInputMasks(inputs.map((i) => i.mask));
@@ -3511,14 +3516,7 @@ export class OotleAccount implements WalletAccountApi {
     const unsignedTx = await resolveTransaction(provider, unsignedBody);
     unsignedTx.inputs = dedupeInputs(unsignedTx.inputs);
 
-    const signers: Signer[] = inputs.map((input) => ({
-      getAddress: async () => walletAddress,
-      getPublicKey: async () => parseOotleAddress(walletAddress).owner_key,
-      signTransaction: async (tx: UnsignedTransactionWithBlobs, sealPublicKey: Uint8Array) => {
-        const json = serializeUnsignedTx(tx);
-        return [await this.signer.addStealthSignature!(json, fromHex(input.nonce), sealPublicKey, { crypto, viewSecret: await this.signer.getViewSecret() })];
-      },
-    }));
+    const signers: Signer[] = inputs.map((input) => this.stealthInputSigner(walletAddress, crypto, input.nonce, input.spendKey));
     const signed = await signTransaction(signers, unsignedTx, { secret_key: this.ownerSecret, public_key: ownerPublicKey });
     const transactionId = await submitTransaction(provider, sealTransaction(signed));
 
@@ -3579,7 +3577,7 @@ export class OotleAccount implements WalletAccountApi {
         if (!decrypted) throw new Error(`unshield: cannot decrypt ${substateId} -- it isn't this account's, or it is already spent.`);
         const nonce = utxoOf(substate).output.output
           .public_nonce;
-        return { commitmentHex, substateId, mask: decrypted.mask, nonce };
+        return { commitmentHex, substateId, mask: decrypted.mask, nonce, spendKey: utxoSpendKey(substate) };
       })
     );
     const inputMask = await crypto.aggregateInputMasks(inputs.map((i) => i.mask));
@@ -3645,14 +3643,7 @@ export class OotleAccount implements WalletAccountApi {
       unsignedBody.dry_run = dryRun;
       const unsignedTx = await resolveTransaction(provider, unsignedBody);
       unsignedTx.inputs = dedupeInputs(unsignedTx.inputs);
-      const signers: Signer[] = inputs.map((input) => ({
-        getAddress: async () => walletAddress,
-        getPublicKey: async () => parseOotleAddress(walletAddress).owner_key,
-        signTransaction: async (tx: UnsignedTransactionWithBlobs, sealPublicKey: Uint8Array) => {
-          const json = serializeUnsignedTx(tx);
-          return [await this.signer.addStealthSignature!(json, fromHex(input.nonce), sealPublicKey, { crypto, viewSecret: await this.signer.getViewSecret() })];
-        },
-      }));
+      const signers: Signer[] = inputs.map((input) => this.stealthInputSigner(walletAddress, crypto, input.nonce, input.spendKey));
       const signed = await signTransaction(signers, unsignedTx, sealKeypair);
       return { envelope: sealTransaction(signed), change, changeCommitment };
     };

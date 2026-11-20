@@ -8,7 +8,7 @@
 // expects a full fetched `Utxo`-shaped substate (via `parseSubstateUtxo`), but a vault's inline
 // `commitments` map holds raw `OutputBody` values directly, with no substate wrapper -- verified
 // against `@tari-project/ootle`'s own type signatures before writing this, not assumed.
-import { decryptInputData, type StealthCryptoProvider } from "@tari-project/ootle";
+import { decryptInputData, transactionBody, type StealthCryptoProvider } from "@tari-project/ootle";
 import type { OutputBody, TransactionEntry } from "@tari-project/ootle-ts-bindings";
 import { fromHex } from "./vault.js";
 
@@ -89,7 +89,8 @@ export async function scanTransactionsForOwnedOutputs(
 ): Promise<ScannedStealthOutput[]> {
   const found: ScannedStealthOutput[] = [];
   for (const entry of transactions) {
-    const tx = entry.transaction.V1.body.transaction;
+    // Schema V1 or V2 (Ootle 0.55): the body has the same shape under either tag.
+    const tx = transactionBody(entry.transaction)!.body.transaction;
     for (const instruction of [...tx.instructions, ...tx.fee_instructions]) {
       if (typeof instruction === "string" || !("StealthTransfer" in instruction)) continue;
       const { resource_address_ref, statement } = instruction.StealthTransfer;
