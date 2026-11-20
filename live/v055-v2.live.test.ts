@@ -64,7 +64,7 @@ it("0.55 V2 signing paths", async () => {
   await step("shield A 2 TARI", () => a.shield(TARI, 2_000_000n));
   await step("private balances A", () => a.getPrivateBalances());
   // Account key + fee UTXO's one-time key (execute's extraSigners).
-  await step("send A->B 1 TARI (private fee)", () => a.send(bAddr, TARI, 1_000_000n, 5000n, { kind: "private", feeResourceAddress: TARI } as never));
+  await step("send A->B 1 TARI (private fee)", () => a.send(bAddr, TARI, 1_000_000n, 50_000n, { kind: "private", feeResourceAddress: TARI } as never));
   // One-time keys only (stealthInputSigner per input).
   await step("sendPrivately A->B 1 TARI", () => a.sendPrivately(TARI, bAddr, 1_000_000n));
   // One-time keys for inputs and the private fee.
@@ -80,7 +80,8 @@ it("0.55 V2 signing paths", async () => {
       a.redeemStealthOutputAndExecute(
         TARI,
         redeem.commitment,
-        200_000n,
+        // The whole output: redemption spends it with no change.
+        BigInt(redeem.amount),
         [{ CallMethod: { call: { Address: aAccount }, method: "deposit", args: [{ Workspace: { id: 0, offset: null } }] } } as never],
         [aAccount],
         100_000n,

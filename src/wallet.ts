@@ -749,6 +749,11 @@ export class OotleAccount implements WalletAccountApi {
     // indexer round trip + proof generation on every retry would buy nothing.
     const accountId = this.ledgerId;
     let privateFee = await this.resolvePrivateFee(feeType, maxFee);
+    // A private fee commits on its own -- the fee phase needs only its stealth UTXO -- so an
+    // undeclared input no longer aborts the whole transaction for the retry below to fix: the main
+    // phase is rejected and the fee is spent anyway. Declare every component the instructions call
+    // (this account included: a transparent fee declares it, a private one doesn't) up front.
+    if (privateFee) inputs = await this.declareCalledComponents(provider, instructions, inputs);
 
     for (let attempt = 0; ; attempt++) {
       const builder = TransactionBuilder.new(this.network, maxEpoch).withInstructions(instructions);
@@ -859,6 +864,38 @@ export class OotleAccount implements WalletAccountApi {
         inputs = await applyKnownVersions([...inputs, resolved], this.network);
       }
     }
+  }
+
+  /**
+   * `inputs` plus every existing component a `CallMethod` in `instructions` targets by address, and
+   * the vaults it holds. A component this transaction itself creates (a new recipient account) does
+   * not exist yet and is skipped.
+   */
+  private async declareCalledComponents(
+    provider: IndexerProvider,
+    instructions: Instruction[],
+    inputs: SubstateRequirement[],
+  ): Promise<SubstateRequirement[]> {
+    const have = new Set(inputs.map((i) => i.substate_id as unknown as string));
+    const extra: SubstateRequirement[] = [];
+    for (const instruction of instructions) {
+      const address = (instruction as { CallMethod?: { call?: { Address?: string } } }).CallMethod?.call?.Address;
+      if (typeof address !== "string" || !address.startsWith("component_") || have.has(address)) continue;
+      have.add(address);
+      try {
+        await withTimeout(getSubstateDecoded(provider, address), 15_000, "checking a called component");
+      } catch (e) {
+        if (e instanceof Error && e.message.startsWith("Timed out")) throw e;
+        continue;
+      }
+      extra.push({ substate_id: address, version: null } as SubstateRequirement);
+      for (const vaultId of await getVaultIdsForAccount(provider, address)) {
+        if (have.has(vaultId)) continue;
+        have.add(vaultId);
+        extra.push({ substate_id: vaultId, version: null } as SubstateRequirement);
+      }
+    }
+    return extra.length ? applyKnownVersions([...inputs, ...extra], this.network) : inputs;
   }
 
   /**
