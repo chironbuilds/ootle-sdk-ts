@@ -800,7 +800,11 @@ export class OotleAccount implements WalletAccountApi {
         // No amount of retrying fixes an empty fee vault — surface this immediately instead of
         // burning the retry budget re-discovering the same "insufficient balance" outcome.
         if (e.message.includes("InsufficientFeesPaid") || /insufficient/i.test(e.message)) {
-          throw new Error(`This account doesn't have enough XTR to pay the transaction fee. Claim testnet XTR first. (${e.message})`);
+          throw new Error(
+            this.network === Network.MainNet
+              ? `This account doesn't have enough TARI to pay the transaction fee. (${e.message})`
+              : `This account doesn't have enough tTARI to pay the transaction fee. Claim testnet tTARI first. (${e.message})`,
+          );
         }
 
         if (e.message.includes("Lock failure")) {
