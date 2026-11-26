@@ -1515,9 +1515,10 @@ export class OotleAccount implements WalletAccountApi {
       }
 
       // The dust below is withdrawn from this account's public vault for the resource. An account that only
-      // ever received this resource privately has no such vault, and the withdraw would be rejected
-      // ("No vault for resource ...") after the fee was already charged.
-      if (!(await this.hasPublicVault(provider, account, resourceAddress))) {
+      // ever received this resource privately has no such vault, and one that shielded its whole public
+      // balance has an empty one; either way the withdraw would be rejected after the fee was already
+      // charged. The no-vault path reveals into a bucket and deposits, which works for both.
+      if (!(await this.hasPublicBalance(provider, account, resourceAddress, dust))) {
         return await this.unshieldWithoutVault(provider, account, resourceAddress, revealedOutAmount, commitments, remainder, maxFee, memo, feeType, accountId);
       }
 
@@ -3464,8 +3465,13 @@ export class OotleAccount implements WalletAccountApi {
     return this.estimateClaimFee(await buildClaim(claimFeeProbe(value), true));
   }
 
-  /** Whether `account` holds a public vault for `resourceAddress` (a private-only holding has none). */
-  private async hasPublicVault(provider: IndexerProvider, account: string, resourceAddress: string): Promise<boolean> {
+  /**
+   * Whether `account` holds a public vault for `resourceAddress` with at least `min` unlocked
+   * revealed units. A private-only holding has no vault at all; an account that shielded its whole
+   * public balance still has the vault, but at 0 -- and the dust withdrawal would be rejected
+   * ("insufficient revealed funds. Required: 1, Available: 0") after the fee was charged.
+   */
+  private async hasPublicBalance(provider: IndexerProvider, account: string, resourceAddress: string, min: bigint): Promise<boolean> {
     const vaultIds = await getVaultIdsForAccount(provider, account);
     if (vaultIds.length === 0) return false;
     const { substates } = await withTimeout(fetchSubstatesDecoded(provider, vaultIds), 15_000, "checking this account's vaults");
@@ -3473,7 +3479,10 @@ export class OotleAccount implements WalletAccountApi {
       const value = substates[id]?.substate;
       if (!value || !("Vault" in value)) continue;
       const [, data] = Object.entries(value.Vault.resource_container)[0] as [string, Record<string, unknown>];
-      if (data.address === resourceAddress) return true;
+      if (data.address !== resourceAddress) continue;
+      const total = BigInt((data.amount ?? data.revealed_amount ?? 0) as string | number | bigint);
+      const locked = BigInt((data.locked_amount ?? 0) as string | number | bigint);
+      return total - locked >= min;
     }
     return false;
   }
